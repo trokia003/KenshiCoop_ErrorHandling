@@ -227,6 +227,14 @@ void loadConfig(Config& c) {
     c.bdoorSync   = envOr("KENSHICOOP_BDOOR_SYNC", "1") != "0";
     c.hungerSync  = envOr("KENSHICOOP_HUNGER_SYNC", "1") != "0";
     c.saveSync    = envOr("KENSHICOOP_SAVE_SYNC", "1") != "0";
+    // Checkpoint-on-risk (saveSync sub-gate): host saves 'coop_risk' shortly
+    // after a NEW NPC squad cohort enters the census (the 2026-07-22 crash
+    // window), throttled to at most one per riskSaveIntervalSec.
+    c.riskSave    = envOr("KENSHICOOP_RISK_SAVE", "1") != "0";
+    {
+        int s = std::atoi(envOr("KENSHICOOP_RISK_SAVE_INTERVAL_S", "180").c_str());
+        c.riskSaveIntervalSec = (s > 0) ? (unsigned int)s : 180u;
+    }
     c.loadSync    = envOr("KENSHICOOP_LOAD_SYNC", "1") != "0";
     c.prodSync    = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
     c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
@@ -259,27 +267,38 @@ void loadConfig(Config& c) {
     }
 
     // Protocol 36 movement-smoothness knobs. Defaults are the historical
-    // constants; any positive env value overrides for live A/B tuning.
+    // constants; any positive env value overrides for live A/B tuning. The
+    // interp knobs also accept coop_config.json values (2026-07-28: a jittery
+    // peer link needs these tuned on a player install where env vars are not
+    // practical - env still wins for the harness).
     {
         c.sendStamp = envOr("KENSHICOOP_SEND_STAMP", "1") != "0";
         int v;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_MIN_DELAY_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_MIN_DELAY_MS",
+                            fileOr(f, "interpMinDelayMs", "0").c_str()).c_str());
         c.interpMinDelayMs = (v > 0) ? (unsigned int)v : 50u;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_DELAY_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_DELAY_MS",
+                            fileOr(f, "interpMaxDelayMs", "0").c_str()).c_str());
         c.interpMaxDelayMs = (v > 0) ? (unsigned int)v : 200u;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_EXTRAP_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_EXTRAP_MS",
+                            fileOr(f, "interpMaxExtrapMs", "0").c_str()).c_str());
         c.interpMaxExtrapMs = (v > 0) ? (unsigned int)v : 250u;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_STALE_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_STALE_MS",
+                            fileOr(f, "interpStaleMs", "0").c_str()).c_str());
         c.interpStaleMs = (v > 0) ? (unsigned int)v : 2000u;
-        double f;
-        f = std::atof(envOr("KENSHICOOP_INTERP_SNAP_DIST", "0").c_str());
-        c.interpSnapDist = (f > 0.0) ? (float)f : 50.0f;
-        f = std::atof(envOr("KENSHICOOP_CATCHUP_K", "0").c_str());
-        c.catchupK = (f > 0.0) ? (float)f : 2.0f;
-        f = std::atof(envOr("KENSHICOOP_SNAP_DIST", "0").c_str());
-        c.snapDist = (f > 0.0) ? (float)f : 8.0f;
-        f = std::atof(envOr("KENSHICOOP_SNAP_SECONDS", "0").c_str());
-        c.snapSeconds = (f > 0.0) ? (float)f : 0.75f;
+        double fv;
+        fv = std::atof(envOr("KENSHICOOP_INTERP_SNAP_DIST",
+                             fileOr(f, "interpSnapDist", "0").c_str()).c_str());
+        c.interpSnapDist = (fv > 0.0) ? (float)fv : 50.0f;
+        fv = std::atof(envOr("KENSHICOOP_CATCHUP_K",
+                             fileOr(f, "catchupK", "0").c_str()).c_str());
+        c.catchupK = (fv > 0.0) ? (float)fv : 2.0f;
+        fv = std::atof(envOr("KENSHICOOP_SNAP_DIST",
+                             fileOr(f, "snapDist", "0").c_str()).c_str());
+        c.snapDist = (fv > 0.0) ? (float)fv : 8.0f;
+        fv = std::atof(envOr("KENSHICOOP_SNAP_SECONDS",
+                             fileOr(f, "snapSeconds", "0").c_str()).c_str());
+        c.snapSeconds = (fv > 0.0) ? (float)fv : 0.75f;
         // Combat convergence bands (0 = keep the drive's ReplicatorUtil default).
         c.combatSoftDist    = (float)std::atof(envOr("KENSHICOOP_COMBAT_SOFT_DIST", "0").c_str());
         c.combatSnapDist    = (float)std::atof(envOr("KENSHICOOP_COMBAT_SNAP_DIST", "0").c_str());
@@ -365,7 +384,8 @@ std::string describeConfig(const Config& c) {
         { "faction", c.factionSync },  { "time",    c.timeSync },
         { "door",    c.doorSync },     { "build",   c.buildSync },
         { "bdoor",   c.bdoorSync },    { "hunger",  c.hungerSync },
-        { "save",    c.saveSync },     { "load",    c.loadSync },
+        { "save",    c.saveSync },     { "riskSave", c.riskSave },
+        { "load",    c.loadSync },
         { "prod",    c.prodSync },     { "research",c.researchSync },
         { "store",   c.storeSync },    { "squad",   c.squadSync },
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },

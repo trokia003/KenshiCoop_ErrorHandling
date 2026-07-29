@@ -421,6 +421,37 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
             // no proxy to remove - just drop our track. Streamed tracks emit a
             // remove so the peer despawns its proxy.
             if (!tr.baseline) { if (nr < 256) removed[nr++] = tr.netId; }
+            else {
+                // v46 ghost fix: the peer holds ITS OWN copy of this save-native
+                // item, and nothing else ever removes it - the "I picked it up
+                // but he still sees it" report. Broadcast a TAKE only when a
+                // player is near the item's last spot (the pickup shape); a
+                // far-away death is a zone unload, and taking the peer's still
+                // -loaded live copy for that would be a wipe.
+                float anchors[12];
+                unsigned int na = engine::interestAnchors(gw, anchors);
+                bool nearPlayer = false;
+                for (unsigned int a = 0; a < na && !nearPlayer; ++a) {
+                    float dx = tr.x - anchors[a * 3 + 0];
+                    float dy = tr.y - anchors[a * 3 + 1];
+                    float dz = tr.z - anchors[a * 3 + 2];
+                    nearPlayer = (dx * dx + dy * dy + dz * dz) <= (60.0f * 60.0f);
+                }
+                if (nearPlayer) {
+                    WorldTakePacket tp;
+                    memset(&tp, 0, sizeof(tp));
+                    tp.type    = (u8)PKT_WORLD_TAKE;
+                    tp.ownerId = ownerId;
+                    tp.takeId  = ++nextTakeId_;
+                    strncpy(tp.stringID, tr.stringID, sizeof(tp.stringID) - 1);
+                    tp.x = tr.x; tp.y = tr.y; tp.z = tr.z;
+                    net.queueWorldTake(tp);
+                    char b[176]; _snprintf(b, sizeof(b) - 1,
+                        "[wi] TAKE-SEND id=%u sid='%s' pos=%.1f,%.1f,%.1f",
+                        tp.takeId, tp.stringID, tp.x, tp.y, tp.z);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
             if (dumpWi) { char b[112]; _snprintf(b, sizeof(b) - 1,
                 "[wi] CULL netId=%u (gone/picked-up) baseline=%d", tr.netId, tr.baseline ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
@@ -743,6 +774,48 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
     }
 }
 
+void Replicator::applyWorldTakes(GameWorld* gw, Inbound& in) {
+    std::deque<InboundWorldTake> got;
+    in.drainWorldTakes(got);
+    if (got.empty()) return;
+    for (std::deque<InboundWorldTake>::iterator it = got.begin(); it != got.end(); ++it) {
+        const WorldTakePacket& p = it->pkt;
+        std::pair<u32, u32> id(p.ownerId, p.takeId);
+        if (appliedTakes_.count(id) != 0) continue; // idempotent (reliable resend)
+        appliedTakes_.insert(id);
+        if (appliedTakes_.size() > 4096) appliedTakes_.erase(appliedTakes_.begin());
+        // Never take a peer-streamed proxy: those carry netId identities and are
+        // removed by their own WORLD_ITEM_REMOVE path.
+        void* exclude[128]; unsigned int nEx = 0;
+        for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
+             pi != worldProxies_.end() && nEx < 128; ++pi)
+            exclude[nEx++] = (void*)pi->second.obj;
+        void* victim = engine::findGroundItemAt(gw, p.stringID, p.x, p.y, p.z,
+                                                24.0f, exclude, nEx);
+        int destroyed = 0;
+        if (victim) {
+            // Retire OUR baseline track of this copy FIRST (by object identity),
+            // so its own liveness death never echoes a TAKE back at the sender.
+            for (std::map<Key, WorldTrack>::iterator wt = worldTrack_.begin();
+                 wt != worldTrack_.end(); ++wt) {
+                if (!wt->second.baseline) continue;
+                if (strcmp(wt->second.stringID, p.stringID) != 0) continue;
+                unsigned int h[5] = { wt->first.t, wt->first.c, wt->first.cs,
+                                      wt->first.i, wt->first.s };
+                if ((void*)engine::resolveObjectByHand(h) == victim) {
+                    worldTrack_.erase(wt);
+                    break;
+                }
+            }
+            destroyed = engine::destroyGroundItemPtr(gw, victim);
+        }
+        char b[192]; _snprintf(b, sizeof(b) - 1,
+            "[wi] TAKE-APPLY id=%u sid='%s' pos=%.1f,%.1f,%.1f destroyed=%d",
+            p.takeId, p.stringID, p.x, p.y, p.z, destroyed);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
     std::deque<InboundWorldDrop> got;
     in.drainWorldDrops(got);
@@ -808,15 +881,31 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
         } else if (!q.empty()) {
             pick = q.begin(); // legacy/no-identity: fall back to oldest same-sid copy
         }
+        int ghostFb = 0;
         if (pick != q.end()) {
             void* item = pick->item;
             moved = engine::addItemPtrToInventory(gw, targetHand, item);
             if (moved) q.erase(pick); // re-homed; stop tracking it on the ground
+        } else if (p.refDropId == 0) {
+            // Ghost-gear fallback: gear already on the ground when the session
+            // started (save loot, NPC-shed equipment) is tracked by NEITHER
+            // channel, so the picker sends ref=0/0 and there is no tracked
+            // copy here - this side's ghost used to stay lying (pickable = the
+            // item-dup report). With ZERO tracked same-sid copies the identity
+            // system has nothing to protect: any FREE same-sid ground item
+            // near the picker IS the untracked shared-save copy - re-home the
+            // nearest. (Tracked duplicates still follow the strict rule above.)
+            void* item = engine::findGroundItemBySidNear(gw, targetHand,
+                                                         p.stringID, 80.0f);
+            if (item) {
+                moved = engine::addItemPtrToInventory(gw, targetHand, item);
+                ghostFb = 1;
+            }
         }
         char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u moved=%d trackedLeft=%u",
+            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u moved=%d trackedLeft=%u ghostFb=%d",
             p.pickupId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
-            p.oSerial, p.refDropOwnerId, p.refDropId, moved, (unsigned)q.size());
+            p.oSerial, p.refDropOwnerId, p.refDropId, moved, (unsigned)q.size(), ghostFb);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // Keep the transfer detector blind to the relocation we just made.
         Key tk; tk.t = p.oType; tk.c = p.oContainer; tk.cs = p.oContainerSerial;

@@ -384,6 +384,19 @@ struct Config {
     // hatch.
     bool          saveSync;
 
+    // KENSHICOOP_RISK_SAVE (default ON; a saveSync sub-gate): checkpoint-on-
+    // risk. The host's census walk flags the moment a NEW NPC squad cohort
+    // enters the census radius - the risk window observed in the 2026-07-22
+    // vanilla host crash (process died ~18 s after a 12-member squad spawned
+    // in). After a short settle the host issues one coordinated save
+    // ('coop_risk', the normal protocol-31 flow: quiesce -> stream -> ACK),
+    // bounding what a crash costs to seconds instead of the autosave gap.
+    // Throttled by riskSaveIntervalSec. "0" is the A/B escape hatch.
+    bool          riskSave;
+    // KENSHICOOP_RISK_SAVE_INTERVAL_S (default 180): minimum seconds between
+    // risk checkpoints - raid waves must not turn into a save storm.
+    unsigned int  riskSaveIntervalSec;
+
     // KENSHICOOP_LOAD_SYNC (default ON): coordinated load (protocol 32) -
     // a mid-session load on the HOST (menu or programmatic - the
     // SaveManager::load detour catches them all) broadcasts PKT_LOAD_GO

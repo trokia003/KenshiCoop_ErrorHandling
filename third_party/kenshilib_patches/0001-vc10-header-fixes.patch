@@ -1,0 +1,66 @@
+﻿diff --git a/KenshiLib/Include/kenshi/Building/Building.h b/KenshiLib/Include/kenshi/Building/Building.h
+index fd1087f..45e1332 100644
+--- a/KenshiLib/Include/kenshi/Building/Building.h
++++ b/KenshiLib/Include/kenshi/Building/Building.h
+@@ -11,6 +11,11 @@
+ #include <kenshi/PhysicsCollection.h>
+ #include <kenshi/PhysicsActual.h>
+ 
++// KenshiCoop local patch: this enum is ALSO defined in Platoon.h (identically);
++// a TU including both headers hits C2011 under VC10. Guard both copies with one
++// macro so whichever is included first wins.
++#ifndef KENSHILIB_BUILDING_DESIGNATION_DEFINED
++#define KENSHILIB_BUILDING_DESIGNATION_DEFINED
+ enum BuildingDesignation
+ {
+     BD_NONE,
+@@ -26,6 +31,7 @@ enum BuildingDesignation
+     BD_SLAVE_STORAGE,
+     BD_RESIDENTIAL_SMALL
+ };
++#endif // KENSHILIB_BUILDING_DESIGNATION_DEFINED
+ 
+ enum BuildingClassType
+ {
+diff --git a/KenshiLib/Include/kenshi/Building/CraftingBuilding.h b/KenshiLib/Include/kenshi/Building/CraftingBuilding.h
+index 59c8737..2d118ab 100644
+--- a/KenshiLib/Include/kenshi/Building/CraftingBuilding.h
++++ b/KenshiLib/Include/kenshi/Building/CraftingBuilding.h
+@@ -7,7 +7,12 @@
+ class InventoryLayout;
+ class Faction;
+ class DatapanelGUI;
+-class CraftingItem;
++// KenshiCoop local patch: VC10 instantiates std::deque<T> when the enclosing
++// class (CraftingBuilding, 'crafting' member below) is completed, so a forward
++// declaration alone fails with C2027. Opaque placeholder body: the plugin never
++// constructs, copies, or dereferences CraftingItem elements - it only needs the
++// type complete for the template instantiation. Do NOT use members through this.
++class CraftingItem { public: char _kc_opaque[0x30]; };
+ 
+ // TODO move?
+ class GameDataGroup
+diff --git a/KenshiLib/Include/kenshi/Platoon.h b/KenshiLib/Include/kenshi/Platoon.h
+index 75eaa5f..0512475 100644
+--- a/KenshiLib/Include/kenshi/Platoon.h
++++ b/KenshiLib/Include/kenshi/Platoon.h
+@@ -28,6 +28,11 @@ class AreaBiomeGroup;
+ class AreaSector;
+ 
+ // TODO move?
++// KenshiCoop local patch: this enum is ALSO defined in Building/Building.h
++// (identically); a TU including both headers hits C2011 under VC10. Guard both
++// copies with one macro so whichever is included first wins.
++#ifndef KENSHILIB_BUILDING_DESIGNATION_DEFINED
++#define KENSHILIB_BUILDING_DESIGNATION_DEFINED
+ enum BuildingDesignation
+ {
+     BD_NONE,
+@@ -43,6 +48,7 @@ enum BuildingDesignation
+     BD_SLAVE_STORAGE,
+     BD_RESIDENTIAL_SMALL
+ };
++#endif // KENSHILIB_BUILDING_DESIGNATION_DEFINED
+ 
+ enum BuildingFunction;
+ 

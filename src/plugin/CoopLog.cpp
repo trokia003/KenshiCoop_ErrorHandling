@@ -18,6 +18,15 @@ bool             g_init = false;
 char             g_tag[16] = { 0 };
 volatile long    g_fakeSkewMs = 0;
 
+// Black-box ring (CrashGuard): the last RING_N lines, kept in static storage
+// so the crash handler can dump them from a dying process without touching
+// the heap or the file. Written under g_cs; READ lock-free by design (a torn
+// line in a crash report beats a deadlocked handler).
+const unsigned int RING_N   = 64;
+const unsigned int RING_LEN = 160;
+char                   g_ring[RING_N][RING_LEN];
+volatile unsigned long g_ringSeq = 0; // total lines ever written
+
 void writeLine(const char* level, const char* msg) {
     if (!g_init) return;
     EnterCriticalSection(&g_cs);
@@ -33,6 +42,11 @@ void writeLine(const char* level, const char* msg) {
                      hh, mm, ss, mmm,
                      g_tag, level, msg ? msg : "");
         std::fflush(g_fp);
+        char* slot = g_ring[g_ringSeq % RING_N];
+        _snprintf(slot, RING_LEN - 1, "[%02lu:%02lu:%02lu.%03lu] %s: %s",
+                  hh, mm, ss, mmm, level, msg ? msg : "");
+        slot[RING_LEN - 1] = '\0';
+        ++g_ringSeq;
     }
     LeaveCriticalSection(&g_cs);
 }
@@ -73,6 +87,43 @@ void logInit(const char* path, const char* modeTag) {
 
 void logLine(const char* msg)    { writeLine("INFO",  msg); }
 void logErrLine(const char* msg) { writeLine("ERROR", msg); }
+
+unsigned int logRecentTo(char* out, unsigned int cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!g_init) return 0;
+    // Deliberately lock-free (crash context): snapshot the sequence, then copy
+    // oldest -> newest. A line racing a writer may come out torn - acceptable.
+    unsigned long seq = g_ringSeq;
+    unsigned long count = seq < RING_N ? seq : RING_N;
+    unsigned int o = 0;
+    for (unsigned long i = 0; i < count; ++i) {
+        const char* s = g_ring[(seq - count + i) % RING_N];
+        for (unsigned int j = 0; s[j] && j < RING_LEN && o < cap - 2; ++j)
+            out[o++] = s[j];
+        if (o < cap - 1) out[o++] = '\n';
+        if (o >= cap - 2) break;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+void logCrashLine(const char* msg) {
+    if (!g_init) return;
+    // TryEnter, not Enter: if the CRASHING thread already holds the log lock
+    // (it faulted mid-logLine), a blocking wait would deadlock the handler.
+    // The crash report file already carries everything; this line is a bonus.
+    if (!TryEnterCriticalSection(&g_cs)) return;
+    if (g_fp) {
+        unsigned long ms = wallClockMs();
+        std::fprintf(g_fp, "[%02lu:%02lu:%02lu.%03lu] [%s] FATAL: %s\n",
+                     (ms / 3600000ul) % 24ul, (ms / 60000ul) % 60ul,
+                     (ms / 1000ul) % 60ul, ms % 1000ul,
+                     g_tag, msg ? msg : "");
+        std::fflush(g_fp);
+    }
+    LeaveCriticalSection(&g_cs);
+}
 
 void logClose() {
     if (!g_init) return;

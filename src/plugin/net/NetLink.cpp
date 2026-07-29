@@ -227,6 +227,8 @@ void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, ou
 
 void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) { pushLocked(outCs_, outWorldPickups_, pkt); }
 
+void NetLink::queueWorldTake(const WorldTakePacket& pkt) { pushLocked(outCs_, outWorldTakes_, pkt); }
+
 void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInvXfers_, pkt); }
 
 void NetLink::queueSaveReq(const SaveReqPacket& pkt) { pushLocked(outCs_, outSaveReq_, pkt); }
@@ -621,6 +623,13 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushWorldPickup(wpp.ownerId, wpp);
                         }
+                    } else if (type == PKT_WORLD_TAKE) {
+                        // Reliable baseline ground-item removal notice (v46).
+                        WorldTakePacket wtp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wtp)
+                            && inbound_) {
+                            inbound_->pushWorldTake(wtp.ownerId, wtp);
+                        }
                     } else if (type == PKT_INV_XFER) {
                         // Reliable cross-owner transfer intent (protocol 37).
                         InvXferPacket ixp;
@@ -900,6 +909,19 @@ void NetLink::threadLoop() {
                         _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
                         b[sizeof(b) - 1] = '\0';
                         netLog(b);
+                        // v46 id hygiene: with NO peers left, the next connect
+                        // is a fresh (or reconnecting) session, not a third
+                        // player - reuse id 1 instead of counting up forever
+                        // (the old counter made every reconnect log the "3+
+                        // players unsupported" error and leak dead-id state).
+                        bool anyLeft = false;
+                        for (size_t pi = 0; pi < enetHost_->peerCount && !anyLeft; ++pi)
+                            if (enetHost_->peers[pi].state == ENET_PEER_STATE_CONNECTED)
+                                anyLeft = true;
+                        if (!anyLeft) {
+                            nextId = 1;
+                            netLog("player id counter reset (no peers connected)");
+                        }
                     } else {
                         serverPeer_ = 0;
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
@@ -1092,6 +1114,23 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < drops.size(); ++i) {
             ENetPacket* out = enet_packet_create(&drops[i], sizeof(WorldDropPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued baseline TAKE notices on CH_RELIABLE (v46).
+        std::vector<WorldTakePacket> takes;
+        EnterCriticalSection(&outCs_);
+        takes.swap(outWorldTakes_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < takes.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&takes[i], sizeof(WorldTakePacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

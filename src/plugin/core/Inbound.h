@@ -87,6 +87,15 @@ struct InboundWorldPickup {
     WorldPickupPacket pkt;
 };
 
+// One received baseline ground-item removal notice (v46): the sender's copy of
+// a save-native ground item stopped being free; the receiver removes its own
+// nearest same-sid free copy at that spot (the ghost the peer would otherwise
+// still see and re-pick).
+struct InboundWorldTake {
+    u32             ownerId;
+    WorldTakePacket pkt;
+};
+
 // One received cross-owner TRANSFER intent (protocol 37): a peer performed a
 // direct UI drag between two containers, at least one of which it does not
 // author. The receiver relocates the REAL item between its own copies of the
@@ -372,6 +381,7 @@ public:
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    wp_(worldReset_),
+        wt_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
@@ -461,6 +471,11 @@ public:
     void pushWorldPickup(u32 ownerId, const WorldPickupPacket& pkt) {
         InboundWorldPickup wp; wp.ownerId = ownerId; wp.pkt = pkt;
         EnterCriticalSection(&cs_); wp_.push_back(wp); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received baseline ground-item removal (v46), owner-tagged.
+    void pushWorldTake(u32 ownerId, const WorldTakePacket& pkt) {
+        InboundWorldTake wt; wt.ownerId = ownerId; wt.pkt = pkt;
+        EnterCriticalSection(&cs_); wt_.push_back(wt); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received cross-owner transfer intent (protocol 37), owner-tagged.
     void pushInvXfer(u32 ownerId, const InvXferPacket& pkt) {
@@ -636,6 +651,9 @@ public:
     void drainWorldPickups(std::deque<InboundWorldPickup>& out) {
         EnterCriticalSection(&cs_); out.swap(wp_); LeaveCriticalSection(&cs_);
     }
+    void drainWorldTakes(std::deque<InboundWorldTake>& out) {
+        EnterCriticalSection(&cs_); out.swap(wt_); LeaveCriticalSection(&cs_);
+    }
     void drainInvXfers(std::deque<InboundInvXfer>& out) {
         EnterCriticalSection(&cs_); out.swap(invXfer_); LeaveCriticalSection(&cs_);
     }
@@ -768,6 +786,7 @@ private:
     WorldQ<InboundWorldDrop>       wd_;
     WorldQ<InboundInvXfer>         invXfer_;
     WorldQ<InboundWorldPickup>     wp_;
+    WorldQ<InboundWorldTake>       wt_;
     WorldQ<InboundMedical>         med_;
     WorldQ<InboundTreatment>       treat_;
     WorldQ<InboundCombatHit>       combatHit_;

@@ -39,6 +39,15 @@ void logSetFakeSkewMs(long skewMs);
 void logLine(const char* msg);
 void logErrLine(const char* msg);
 
+// CrashGuard black box: copy the last ~64 log lines (oldest first, newline-
+// separated, NUL-terminated) into 'out'. Returns bytes written. Lock-FREE by
+// design - safe to call from a crash handler; a torn line is acceptable.
+unsigned int logRecentTo(char* out, unsigned int cap);
+
+// Crash-context FATAL line: like logErrLine but TryEnterCriticalSection - a
+// crashing thread that already holds the log lock skips instead of deadlocking.
+void logCrashLine(const char* msg);
+
 // Flush and close the file. Called right before ExitProcess on test self-exit.
 void logClose();
 

@@ -24,7 +24,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 45;
+const u16 PROTOCOL_VERSION = 46;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -69,7 +69,8 @@ enum PacketType {
     PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
-    PKT_COMBAT_HIT       = 42 // RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_WORLD_TAKE       = 43 // RELIABLE baseline ground-item removal (v46, either direction); WorldTakePacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -551,6 +552,20 @@ struct WorldPickupPacket {
     // picker couldn't correlate an instance and the peer falls back to its oldest same-sid copy.
     u32 refDropOwnerId;
     u32 refDropId;
+};
+
+// v46: removal notice for a BASELINE (save-native, never-streamed) ground item.
+// Both clients hold their own copy of such an item from the shared save; when
+// one side's copy stops being a free ground item (picked up / consumed), the
+// peer removes its nearest same-sid free copy within a small radius of the
+// item's last position. The picker's bag converges via the normal inventory
+// snapshot; this packet only prevents the ground ghost.
+struct WorldTakePacket {
+    u8   type;         // = PKT_WORLD_TAKE
+    u32  ownerId;      // network player id of the sender
+    u32  takeId;       // monotonic per-sender (idempotency)
+    char stringID[48]; // template sid of the taken item
+    float x, y, z;     // the item's last known ground position
 };
 
 // ---- Protocol 37: cross-owner TRANSFER intent --------------------------------
@@ -1064,6 +1079,11 @@ struct SaveBeginPacket {
     char name[48];  // save name (the join stages save/<name>__incoming/)
     u16  fileCount; // files that will follow
     unsigned __int64 totalBytes; // sum of file sizes (progress + sanity)
+    // v46 DELTA transfers: 1 = only files changed since the last ACKed
+    // transfer of this save follow; the receiver merges them ONTO its
+    // committed copy instead of swap-replacing the folder. 0 = full send
+    // (first transfer, a file was deleted sender-side, or post-reconnect).
+    u8   delta;
 };
 
 // Host -> join: one chunk of one file. Variable length:

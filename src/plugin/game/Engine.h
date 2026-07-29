@@ -723,6 +723,28 @@ unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
 // relocateWeaponToGround. Returns 1 on success. `item` must be a still-live tracked object.
 int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item);
 
+// SEH-guarded (ghost-gear fallback): the nearest FREE ground Item whose
+// template sid matches, within `radius` of the object at nearHand, as a void*
+// for addItemPtrToInventory - or 0. For peer pickups that carry NO drop
+// identity when NO tracked same-sid copy exists: gear already on the ground
+// when the session started (save loot, NPC-shed equipment) is tracked by
+// neither item channel, so this spatial match is the only way to remove the
+// local copy the picker just took on their machine.
+void* findGroundItemBySidNear(GameWorld* gw, const unsigned int nearHand[5],
+                              const char* sid, float radius);
+
+// SEH-guarded (v46 baseline TAKE apply): the nearest FREE ground Item with a
+// matching template sid within `radius` of an explicit world position,
+// skipping any pointer in exclude[] (peer-streamed proxies have their own
+// remove path). Returns the Item* as void*, or 0.
+void* findGroundItemAt(GameWorld* gw, const char* sid, float x, float y, float z,
+                       float radius, void* const* exclude, unsigned int nExclude);
+
+// SEH-guarded: destroy a free ground item object (GameWorld::destroy). The
+// TAKE apply removes the local ghost copy of an item the peer's world no
+// longer has on the ground. Returns 1 on success.
+int destroyGroundItemPtr(GameWorld* gw, void* item);
+
 // ---- Equipped-gear (armour/weapon slot) test hooks (inv_equip scenario) ----
 // SEH-guarded: report the first EQUIPPED item worn by the object at cHand (its
 // template stringID + itemType) and the total count of worn items. Returns 1 if any
@@ -1413,6 +1435,7 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
 struct BuildRead {
     unsigned int hand[5]; // local hand [type, container, containerSerial, index, serial]
     float x, y, z;        // world position
+    float yaw;            // world yaw (radians; the peer's mint orientation)
     float progress;       // ConstructionState::constructionProgress (0..1)
     int   complete;       // ConstructionState::isComplete
     char  sid[48];        // template GameData stringID (wire identity)
@@ -1432,6 +1455,12 @@ struct BuildEdge {
 // Every successful placement queues a BuildEdge the Replicator drains.
 bool installBuildHook();
 unsigned int drainBuildEdges(BuildEdge* out, unsigned int maxOut);
+// Push a placement edge programmatically (the build-census fallback capture:
+// placeFinalPreviewBuilding is VIRTUAL and subclass previews - walls - override
+// it, so detour-missed placements are announced from the site census instead).
+// fromUi: 1 = UI detour, 0 = probe/programmatic, 2 = census-captured.
+void queueBuildEdgeRec(const unsigned int bHand[5], const char* sid,
+                       float x, float y, float z, float yaw, int fromUi);
 // SEH-guarded enumeration of INCOMPLETE construction sites among BUILDING
 // objects within radius of the interest centers (complete/baked buildings are
 // legion and never stream - only sites under construction are interesting).

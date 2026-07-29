@@ -80,6 +80,7 @@ public:
     // MAIN thread: queue a reliable conservation PICKUP intent (Phase W3), mirror of the
     // drop. The peer re-homes its tracked ground copy back into the character's bag.
     void queueWorldPickup(const WorldPickupPacket& pkt);
+    void queueWorldTake(const WorldTakePacket& pkt);
 
     // MAIN thread: queue a reliable cross-owner TRANSFER intent (protocol 37). The peer
     // relocates the real item between its own copies of the two containers.
@@ -247,6 +248,7 @@ private:
     // Reliable conservation DROP intents (Phase W2), fixed-size PODs. Guarded by outCs_.
     std::vector<WorldDropPacket> outWorldDrops_;
     std::vector<WorldPickupPacket> outWorldPickups_;
+    std::vector<WorldTakePacket>   outWorldTakes_;
     // Reliable cross-owner transfer intents (protocol 37). Guarded by outCs_.
     std::vector<InvXferPacket>   outInvXfers_;
     // Reliable medical snapshots + treatment deltas (phase 2). Guarded by outCs_.

@@ -972,11 +972,20 @@ void __fastcall placeFinal_hook(PreviewBuilding* self) {
     __try {
         if (!self) return;
         Building* b = self->justBeenBuilt;
-        if (!b) return; // commit refused (placement rules) - nothing placed
+        if (!b) { // commit refused (placement rules) - nothing placed
+            coop::logLine("[build] PLACE-HOOK fired: commit refused (no justBeenBuilt)");
+            return;
+        }
         BuildEdgeRec e;
         memset(&e, 0, sizeof(e));
         RootObject* ro = static_cast<RootObject*>(b);
-        if (!readObjectHand(ro, e.hand)) return;
+        if (!readObjectHand(ro, e.hand)) {
+            // LOUD (2026-07-28): this used to return silently, making a missed
+            // capture indistinguishable from the detour never firing. The
+            // build-census fallback (publishBuilds 1a) announces the site.
+            coop::logLine("[build] PLACE-HOOK fired: hand unresolved (census fallback will announce)");
+            return;
+        }
         GameData* gd = ro->getGameData();
         if (gd) {
             strncpy(e.sid, gd->stringID.c_str(), sizeof(e.sid) - 1);

@@ -107,25 +107,69 @@ unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut
 
 bool readWalletByHand(const unsigned int mHand[5], int* outMoney) {
     if (outMoney) *outMoney = -1;
-    if (!mHand || !outMoney || !g_ownGetMoneyFn) return false;
+    if (!mHand || !outMoney) return false;
     Character* c = resolveCharByHand(mHand[3], mHand[4], mHand[0], mHand[1], mHand[2]);
     if (!c) return false;
     __try {
+        // Character::getMoney is the engine's OWN display/spend read - it
+        // resolves the canonical wallet for the body's group. The 2026-07-28
+        // live sessions showed the legacy Ownerships::money chain reads 0 on
+        // BOTH clients' real saves while the players demonstrably hold cats,
+        // so this virtual is now the primary getter.
+        int viaChar = -1;
+        __try { viaChar = c->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        // One-shot probe: compare the sources the first few reads so a session
+        // log settles where this save keeps its cats.
+        static int s_probeLeft = 3; // main-thread only
+        if (s_probeLeft > 0) {
+            --s_probeLeft;
+            int viaOwn = -1;
+            __try {
+                Ownerships* ow = walletOf(c);
+                if (ow && g_ownGetMoneyFn) viaOwn = g_ownGetMoneyFn(ow);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[money] wallet-probe char=%d ownerships=%d",
+                      viaChar, viaOwn);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (viaChar >= 0) { *outMoney = viaChar; return true; }
+        // Fallback: the legacy Ownerships chain (pre-fix behaviour).
         Ownerships* ow = walletOf(c);
-        if (!ow) return false;
+        if (!ow || !g_ownGetMoneyFn) return false;
         *outMoney = g_ownGetMoneyFn(ow);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool writeWalletByHand(const unsigned int mHand[5], int money) {
-    if (!mHand || money < 0 || !g_ownSetMoneyFn) return false;
+    if (!mHand || money < 0) return false;
     Character* c = resolveCharByHand(mHand[3], mHand[4], mHand[0], mHand[1], mHand[2]);
     if (!c) return false;
     __try {
+        // Verify-driven write ladder. Step 1: the legacy Ownerships setter.
+        // Step 2: read back through Character::getMoney (the canonical read);
+        // if the write did not land there, apply the remaining DELTA through
+        // Character::takeMoney - the engine's own spend primitive, which by
+        // definition moves the wallet the game actually uses (negative n
+        // credits; SEH-guarded, verified again). A still-standing mismatch is
+        // logged loudly instead of silently desyncing.
         Ownerships* ow = walletOf(c);
-        if (!ow) return false;
-        g_ownSetMoneyFn(ow, money);
+        if (ow && g_ownSetMoneyFn) g_ownSetMoneyFn(ow, money);
+        int got = -1;
+        __try { got = c->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (got == money || got < 0) return true; // landed (or unverifiable)
+        __try { c->takeMoney(got - money); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        int got2 = -1;
+        __try { got2 = c->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (got2 != money) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[money] APPLY verify want=%d ownSet->%d takeDelta->%d",
+                      money, got, got2);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -487,6 +531,9 @@ static void fillBuildRead(Building* b, BuildRead* r) {
     readObjectHand(ro, r->hand);
     Ogre::Vector3 p = ro->getPosition();
     r->x = p.x; r->y = p.y; r->z = p.z;
+    // World yaw for the census-capture announce path (the peer mints at this
+    // orientation; the UI detour reads the preview's own yaw instead).
+    r->yaw = ro->getOrientation().getYaw().valueRadians();
     r->progress = b->_buildState.constructionProgress;
     r->complete = b->_buildState.isComplete ? 1 : 0;
     GameData* gd = ro->getGameData();
@@ -496,6 +543,19 @@ static void fillBuildRead(Building* b, BuildRead* r) {
         strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
         r->name[sizeof(r->name) - 1] = '\0';
     }
+}
+
+void queueBuildEdgeRec(const unsigned int bHand[5], const char* sid,
+                       float x, float y, float z, float yaw, int fromUi) {
+    if (!bHand || !sid || !sid[0]) return;
+    BuildEdgeRec e;
+    memset(&e, 0, sizeof(e));
+    memcpy(e.hand, bHand, sizeof(e.hand));
+    strncpy(e.sid, sid, sizeof(e.sid) - 1);
+    e.sid[sizeof(e.sid) - 1] = '\0';
+    e.x = x; e.y = y; e.z = z; e.yaw = yaw;
+    e.fromUi = fromUi;
+    if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
 }
 
 unsigned int enumSitesNear(GameWorld* gw, float radius, BuildRead* out, unsigned int maxOut) {

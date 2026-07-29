@@ -545,6 +545,21 @@ unsigned int Replicator::tabRepresentatives(GameWorld* gw, unsigned int rankHand
     return nRanks;
 }
 
+// The wallet is ONE SHARED number (confirmed by design 2026-07-28) - Kenshi
+// displays and spends a single faction-wide cats pool, whatever squad acts.
+// The per-tab absolute model above (each client streams "its" tab's wallet)
+// therefore had TWO authoritative writers to one value: a peer's slightly
+// stale absolute could resurrect spent money. v46 model, single-writer:
+//   * HOST is the wallet's authority: it streams the ABSOLUTE value
+//     (change-gated + safety resend, tabRank=0 on the wire).
+//   * JOIN applies host absolutes, and forwards its own LOCAL wallet movement
+//     (purchases/sales) as DELTAS (tabRank=1, money = signed delta) computed
+//     against the last value it saw/applied; the host folds each delta into
+//     the wallet, and its own change-gate broadcasts the new absolute back.
+// Deltas commute with the host's stream, so a crossing update converges
+// instead of clobbering. Both sides read/write through their own tab leader
+// (any resolvable body reaches the one shared wallet).
+
 void Replicator::publishMoney(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!moneySync_) return;
@@ -554,32 +569,52 @@ void Replicator::publishMoney(const SyncContext& ctx) {
     unsigned long now = nowMs();
     unsigned int rankHand[MAX_RANKS][5];
     unsigned int nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
+    // First OWNED resolvable tab leader = our handle onto the shared wallet.
+    unsigned int myRank = 0xFFFFFFFFu;
     for (unsigned int r = 0; r < nRanks; ++r) {
-        // Own-tabs only (the same partition rule as publishOwned's entity filter).
         bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
-        if (!owned || rankHand[r][0] == 0xFFFFFFFFu) continue;
-        int money = -1;
-        if (!engine::readWalletByHand(rankHand[r], &money) || money < 0) continue;
-        MoneyPub& mp = moneyPub_[r];
+        if (owned && rankHand[r][0] != 0xFFFFFFFFu) { myRank = r; break; }
+    }
+    if (myRank == 0xFFFFFFFFu) return;
+    int money = -1;
+    if (!engine::readWalletByHand(rankHand[myRank], &money) || money < 0) return;
+
+    if (ctx.isHost) {
+        // Authority: stream the absolute.
+        MoneyPub& mp = moneyPub_[0];
         bool changed = (money != mp.lastSent);
-        // Money has no silent seed step, so a never-sent row is resend-due: a
-        // fresh wallet still streams once. (resendUnsent = true.)
         if (!sync::gateShouldSend(changed, now, mp.lastSendMs, MIN_SEND_MS,
                                   RESEND_MS, /*resendUnsent*/ true))
-            continue;
+            return;
         mp.lastSent = money; mp.lastSendMs = now;
         MoneyPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_MONEY;
         pkt.ownerId = ownerId;
-        pkt.tabRank = r;
+        pkt.tabRank = 0;      // v46: host row = ABSOLUTE shared-wallet value
         pkt.money   = money;
         net.queueMoney(pkt);
-        if (changed) { // resends stay silent; the change is the signal
+        if (changed) {
             char b[96];
-            _snprintf(b, sizeof(b) - 1, "[money] SEND rank=%u cats=%d", r, money);
+            _snprintf(b, sizeof(b) - 1, "[money] SEND abs=%d", money);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
+    } else {
+        // Join: forward local movement as a DELTA against the last seen value.
+        if (moneyExpected_ < 0) { moneyExpected_ = money; return; } // first read seeds
+        int delta = money - moneyExpected_;
+        if (delta == 0) return;
+        moneyExpected_ = money;
+        MoneyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_MONEY;
+        pkt.ownerId = ownerId;
+        pkt.tabRank = 1;      // v46: join row = signed DELTA
+        pkt.money   = delta;
+        net.queueMoney(pkt);
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[money] SEND delta=%+d (local=%d)", delta, money);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
 
@@ -591,27 +626,44 @@ void Replicator::applyMoney(const SyncContext& ctx) {
     if (!moneySync_) return;
     const unsigned int MAX_RANKS = 8;
     unsigned int rankHand[MAX_RANKS][5];
-    unsigned int nRanks = 0;
-    bool haveRanks = false;
+    unsigned int nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
+    unsigned int myRank = 0xFFFFFFFFu;
+    for (unsigned int r = 0; r < nRanks; ++r) {
+        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
+        if (owned && rankHand[r][0] != 0xFFFFFFFFu) { myRank = r; break; }
+    }
+    // Fallback: any resolvable leader reaches the shared wallet.
+    if (myRank == 0xFFFFFFFFu)
+        for (unsigned int r = 0; r < nRanks; ++r)
+            if (rankHand[r][0] != 0xFFFFFFFFu) { myRank = r; break; }
+    if (myRank == 0xFFFFFFFFu) return;
     for (std::deque<InboundMoney>::iterator it = got.begin(); it != got.end(); ++it) {
         const MoneyPacket& p = it->pkt;
-        unsigned int r = p.tabRank;
-        // Never write a tab we own - our engine is that wallet's authority.
-        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
-        if (owned || p.money < 0) continue;
-        if (!haveRanks) { // one census per drain (cheap; usually 1 packet anyway)
-            nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
-            haveRanks = true;
-        }
-        if (r >= nRanks || rankHand[r][0] == 0xFFFFFFFFu) continue;
         int cur = -1;
-        engine::readWalletByHand(rankHand[r], &cur);
-        if (cur == p.money) continue; // already converged (resend or echo)
-        bool ok = engine::writeWalletByHand(rankHand[r], p.money);
-        char b[112];
-        _snprintf(b, sizeof(b) - 1, "[money] RECV rank=%u cats=%d was=%d ok=%d",
-                  r, p.money, cur, ok ? 1 : 0);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!engine::readWalletByHand(rankHand[myRank], &cur) || cur < 0) continue;
+        if (ctx.isHost) {
+            // Peer rows are DELTAS: fold into the authoritative wallet.
+            if (p.money == 0) continue;
+            int next = cur + p.money;
+            if (next < 0) next = 0;
+            bool ok = engine::writeWalletByHand(rankHand[myRank], next);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[money] RECV delta=%+d was=%d now=%d ok=%d",
+                      p.money, cur, next, ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            // Host rows are ABSOLUTES: adopt, and rebase our delta detector.
+            if (p.money < 0) continue;
+            if (cur != p.money) {
+                bool ok = engine::writeWalletByHand(rankHand[myRank], p.money);
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "[money] RECV abs=%d was=%d ok=%d", p.money, cur, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            moneyExpected_ = p.money;
+        }
     }
 }
 
@@ -1092,6 +1144,98 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
+    // 1a. Placement-capture fallback census (2026-07-28: a live session where
+    // the host placed buildings produced ZERO detour edges all evening -
+    // placeFinalPreviewBuilding is a VIRTUAL whose base impl the hook targets,
+    // wall/gate previews override it, and the detour's hand-resolve miss was
+    // silent). Every ~2 s: diff the incomplete-site census against the session
+    // seen-set. First walk seeds the save's baked sites silently; a later NEW
+    // site that is neither already announced nor a peer proxy is OUR
+    // unannounced placement - queue it as a fromUi=2 edge (drained by step 1
+    // next tick into the normal PKT_BUILD_PLACE flow). The apply side skips
+    // mints for keys that resolve locally, so a mis-announced baked site can
+    // never mint a duplicate on the peer.
+    {
+        const unsigned long BUILD_CENSUS_MS = 2000;
+        unsigned long now = nowMs();
+        if (buildCensusMs_ == 0 || (now - buildCensusMs_) >= BUILD_CENSUS_MS) {
+            buildCensusMs_ = now;
+            static engine::BuildRead sites[64]; // main-thread only
+            unsigned int ns = engine::enumSitesNear(ctx.gw, 400.0f, sites, 64);
+            std::set<Key> walkSeen;
+            for (unsigned int i = 0; i < ns; ++i) {
+                Key k; k.t = sites[i].hand[0]; k.c = sites[i].hand[1];
+                k.cs = sites[i].hand[2]; k.i = sites[i].hand[3]; k.s = sites[i].hand[4];
+                walkSeen.insert(k);
+                bool fresh = buildCensusSeen_.insert(k).second;
+                bool isOwn   = (ownBuilds_.find(k) != ownBuilds_.end());
+                bool isProxy = (mintByLocal_.find(k) != mintByLocal_.end());
+                // v46 baked-site progress: a site BOTH saves contain (baseline-
+                // seeded, neither announced nor a proxy) streams its progress
+                // keyed by the SAVE-STABLE hand. The apply side merges by MAX,
+                // so both players' building work converges without an owner
+                // (progress only rises; stale rows are no-ops by construction).
+                if (buildCensusSeeded_ && !fresh && !isOwn && !isProxy) {
+                    BakedRow& br = bakedRows_[k];
+                    float prog = sites[i].progress;
+                    bool moved = (br.lastSent < 0.0f) ||
+                                 (prog - br.lastSent >= 0.005f);
+                    if (moved && (br.lastSendMs == 0 ||
+                                  (now - br.lastSendMs) >= 1000)) {
+                        br.lastSent = prog; br.lastSendMs = now;
+                        BuildStatePacket sp;
+                        memset(&sp, 0, sizeof(sp));
+                        sp.type = (u8)PKT_BUILD_STATE;
+                        sp.ownerId = ctx.localId;
+                        sp.seq = buildSeqOut_++;
+                        for (unsigned int h = 0; h < 5; ++h) sp.key[h] = sites[i].hand[h];
+                        sp.progress = prog;
+                        sp.complete = 0;
+                        ctx.net->queueBuildState(sp);
+                    }
+                }
+                if (!buildCensusSeeded_ || !fresh) continue;
+                if (isOwn || isProxy) continue;
+                if (!sites[i].sid[0]) continue;
+                engine::queueBuildEdgeRec(sites[i].hand, sites[i].sid,
+                                          sites[i].x, sites[i].y, sites[i].z,
+                                          sites[i].yaw, /*fromUi*/ 2);
+                char b[224];
+                _snprintf(b, sizeof(b) - 1,
+                          "[build] CENSUS-PLACE sid='%s' hand=%u.%u.%u.%u.%u "
+                          "pos=%.1f,%.1f,%.1f (detour missed this path)",
+                          sites[i].sid, sites[i].hand[0], sites[i].hand[1],
+                          sites[i].hand[2], sites[i].hand[3], sites[i].hand[4],
+                          sites[i].x, sites[i].y, sites[i].z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // A tracked baked site that LEFT the incomplete census either
+            // completed (send the latched complete=1 row so the peer finishes
+            // it natively) or unloaded (drop the row silently).
+            for (std::map<Key, BakedRow>::iterator br = bakedRows_.begin();
+                 br != bakedRows_.end(); ) {
+                if (walkSeen.count(br->first) != 0) { ++br; continue; }
+                unsigned int kh[5] = { br->first.t, br->first.c, br->first.cs,
+                                       br->first.i, br->first.s };
+                engine::BuildRead cur;
+                if (engine::readBuildingByHand(kh, &cur) && cur.complete) {
+                    BuildStatePacket sp;
+                    memset(&sp, 0, sizeof(sp));
+                    sp.type = (u8)PKT_BUILD_STATE;
+                    sp.ownerId = ctx.localId;
+                    sp.seq = buildSeqOut_++;
+                    for (unsigned int h = 0; h < 5; ++h) sp.key[h] = kh[h];
+                    sp.progress = 1.0f;
+                    sp.complete = 1;
+                    ctx.net->queueBuildState(sp);
+                    coop::logLine("[build] BAKED-STATE complete=1 (shared site finished)");
+                }
+                bakedRows_.erase(br++);
+            }
+            if (!buildCensusSeeded_) buildCensusSeeded_ = true;
+        }
+    }
+
     // 1b. Removal edges (protocol 28): the dismantle detour (UI path) and the
     // programmatic destroy both queue hands here. Only buildings WE placed
     // stream a REMOVE (placer-authoritative); a dismantle of a baked building
@@ -1183,6 +1327,28 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         k.i = p.key[3]; k.s = p.key[4];
         if (peerBuilds_.find(k) != peerBuilds_.end())
             continue; // already minted (or mint already refused) - dedupe
+        // Duplicate guard for the census-capture announce path (fromUi=2): a
+        // key that RESOLVES locally is a baked site both saves share (runtime
+        // placements never resolve on the peer - the protocol-21 rule). Map it
+        // to itself so STATE rows apply to the real object; never mint a copy
+        // on top of it.
+        {
+            engine::BuildRead shared;
+            unsigned int kh[5] = { p.key[0], p.key[1], p.key[2], p.key[3], p.key[4] };
+            if (engine::readBuildingByHand(kh, &shared)) {
+                PeerBuild& pbShared = peerBuilds_[k];
+                memcpy(pbShared.localHand, kh, sizeof(pbShared.localHand));
+                pbShared.minted = 1;
+                mintByLocal_[k] = k;
+                char b[200];
+                _snprintf(b, sizeof(b) - 1,
+                          "[build] PLACE key=%u.%u.%u.%u.%u sid='%s' resolves "
+                          "locally (shared site) - mapped, no mint",
+                          p.key[0], p.key[1], p.key[2], p.key[3], p.key[4], p.sid);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                continue;
+            }
+        }
         PeerBuild& pb = peerBuilds_[k];
         // Mint INCOMPLETE always: the placer's STATE rows drive progress from
         // here (a real UI placement starts at 0 anyway).
@@ -1212,8 +1378,28 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
         std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
-        if (f == peerBuilds_.end() || !f->second.minted)
-            continue; // mint refused or key unknown - skip silently
+        if (f == peerBuilds_.end() || !f->second.minted) {
+            // v46 baked-site progress: a key with NO peer-build record that
+            // resolves LOCALLY is a shared save-native site - merge by MAX
+            // (both players' construction work combines; a stale row is a
+            // natural no-op, so no seq guard is needed on this path).
+            unsigned int kh[5] = { p.key[0], p.key[1], p.key[2], p.key[3], p.key[4] };
+            engine::BuildRead cur;
+            if (engine::readBuildingByHand(kh, &cur) && !cur.complete &&
+                (p.progress > cur.progress + 0.004f || p.complete)) {
+                engine::BuildRead post;
+                engine::writeBuildProgressByHand(kh, p.complete ? 1.0f : p.progress,
+                                                 &post);
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "[build] BAKED-MERGE key=%u.%u.%u.%u.%u prog %.3f -> %.3f%s",
+                          p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                          cur.progress, post.progress,
+                          p.complete ? " (complete)" : "");
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            continue; // mint refused / unknown runtime key - skip silently
+        }
         PeerBuild& pb = f->second;
         if (pb.removed) continue; // tombstoned (REMOVE already applied)
         if (!sync::gateSeqAccept(pb.seqSeen, p.seq)) continue; // stale/dup row

@@ -646,6 +646,36 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     net.queueNpcCensus(ownerId, hands, poss, n);
 
+    // Checkpoint-on-risk arming: reduce this walk to its squad COHORTS (the
+    // hand container triple all members of one squad share - the 2026-07-22
+    // crash squad was 12 bodies, ONE cohort 1,55,3348510720) and arm a risk
+    // edge for every cohort this session has never census'd before. The first
+    // walk after a load seeds silently: the standing world population is not
+    // a spawn-in. Consumed by riskCheckpointDue after its settle window.
+    {
+        unsigned int newCohorts = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            Key sq;
+            sq.t  = states[i].hType;
+            sq.c  = states[i].hContainer;
+            sq.cs = states[i].hContainerSerial;
+            sq.i  = 0; sq.s = 0; // cohort key: container triple only
+            if (censusSquadsSeen_.insert(sq).second && censusSquadsSeeded_)
+                ++newCohorts;
+        }
+        if (!censusSquadsSeeded_) {
+            censusSquadsSeeded_ = true;
+        } else if (newCohorts > 0) {
+            if (riskEventMs_ == 0) riskEventMs_ = now;
+            riskNewSquads_ += newCohorts;
+            char rb[128];
+            _snprintf(rb, sizeof(rb) - 1,
+                      "[census] NEW-SQUAD cohorts=%u (risk edge armed, pending=%u)",
+                      newCohorts, riskNewSquads_);
+            rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+        }
+    }
+
     // Phase 2 mid-band tier: rebuild the round-robin list from this census
     // walk. Everything beyond the stream bubble's KEEP band belongs to the
     // mid tier; nearest-first so a MAX_PUBLISH squeeze drops the farthest.
@@ -734,6 +764,16 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
     }
+}
+
+bool Replicator::riskCheckpointDue(unsigned long settleMs, unsigned int* outNewSquads) {
+    if (riskEventMs_ == 0) return false;
+    unsigned long now = nowMs();
+    if ((now - riskEventMs_) < settleMs) return false; // let the spawn land first
+    if (outNewSquads) *outNewSquads = riskNewSquads_;
+    riskEventMs_   = 0;
+    riskNewSquads_ = 0;
+    return true;
 }
 
 void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,

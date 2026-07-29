@@ -516,7 +516,17 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // proxy body's ACTUAL local position, in the SCENARIO series shape (hand
     // order i,s,t,c,cs like MEMBER/RECV lines) so the spawn_sync oracle can
     // time-pair it with the host's MEMBER series per hand.
-    if (!proxyByKey_.empty() && (now - spawnPosLogMs_) >= 500) {
+    // Free-play gate (v46): this series exists for the harness oracles; at
+    // 2 Hz x every proxy it wrote a join-side log 78 MB in one evening and
+    // taxed the main thread with per-line flushes. Scenario runs (or the
+    // KENSHICOOP_PROXY_DUMP=1 escape hatch) keep it; free play stays quiet.
+    static int dumpProxies = -1;
+    if (dumpProxies < 0) {
+        const char* e = getenv("KENSHICOOP_PROXY_DUMP");
+        dumpProxies = (e && e[0] == '1') ? 1 : 0;
+    }
+    if ((proxyTelemetry_ || dumpProxies == 1) &&
+        !proxyByKey_.empty() && (now - spawnPosLogMs_) >= 500) {
         spawnPosLogMs_ = now;
         for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
              it != proxyByKey_.end(); ++it) {

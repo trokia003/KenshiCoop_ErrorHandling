@@ -28,6 +28,7 @@
 
 #include "CoopLog.h"
 #include "core/Config.h"
+#include "core/CrashGuard.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
 #include "net/NetLink.h"
@@ -302,6 +303,9 @@ void processNetEvents(GameWorld* gw) {
         // release any carry or occupancy its driven copies still hold.
         if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
         g_peerPresent = false;
+        // v46 delta transfers: a reconnecting peer's disk state must be
+        // re-proven, so the next send after any disconnect is a FULL one.
+        coop::savexfer::resetPeerState();
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
@@ -1167,6 +1171,64 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
 // the load/save ENTRY points - never a cached world pointer the swap invalidates.
 void tickCoordinatedSaveLoad(GameWorld* gw) {
     if (g_gameStarted) {
+        // Checkpoint-on-risk: a NEW NPC squad cohort entered the host's census
+        // (armed by publishNpcCensus, consumed once settled) -> issue ONE
+        // coordinated 'coop_risk' save through the normal protocol-31 flow
+        // (the saveGameAs detour edge arms the quiescence watch below, then
+        // the folder streams to the join). Bounds what a crash in the spawn
+        // window costs to seconds. Gates: host + peer + world LIVE (never
+        // mid-swap), no save already in flight, and the interval throttle.
+        //
+        // PEER-SETTLE GATE (2026-07-28 stalled-connect fix): the edge is only
+        // consumed once the peer has been present a while. Firing on the
+        // connect edge itself queued a SECOND engine save in the same tick as
+        // the connect-push bootstrap bake; the engine performs one deferred
+        // save per tick, the quiescence watch got re-armed onto the never-
+        // written 'coop_risk' folder, timed out at 0 files, and the join never
+        // received the save push ("connected then nothing"). The stale pre-
+        // connect edge simply waits: if those squads still matter a minute in,
+        // it fires then; the bootstrapArmed check covers a slow bake too.
+        {
+            static DWORD s_peerSince = 0; // main-thread only
+            if (!g_peerPresent) s_peerSince = 0;
+            else if (s_peerSince == 0) s_peerSince = GetTickCount();
+            const unsigned long RISK_PEER_SETTLE_MS = 60000;
+        if (g_cfg.isHost && g_cfg.saveSync && g_cfg.riskSave &&
+            g_peerPresent && gw && g_swapStartTick == 0 &&
+            s_peerSince != 0 &&
+            (GetTickCount() - s_peerSince) >= RISK_PEER_SETTLE_MS &&
+            !g_bootstrapArmed &&
+            // "Save in flight" = quiescence watch armed OR transfer streaming.
+            // NOT g_savePending: that latch is only cleared by the bootstrap/
+            // load paths, so it stays set after a normal transfer completes -
+            // gating on it silently disabled every risk save after the first
+            // (2026-07-28 session: 20 cohorts pending, zero checkpoints).
+            !coop::savexfer::watching() && !coop::savexfer::sending()) {
+            const unsigned long RISK_SETTLE_MS = 8000; // let the spawn land
+            static DWORD s_lastRiskSave = 0;           // main-thread only
+            unsigned int newSquads = 0;
+            if (g_repl.riskCheckpointDue(RISK_SETTLE_MS, &newSquads)) {
+                DWORD now = GetTickCount();
+                if (s_lastRiskSave != 0 &&
+                    (now - s_lastRiskSave) < g_cfg.riskSaveIntervalSec * 1000ul) {
+                    char b[144];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[save] RISK-CHECKPOINT skipped (throttle): newSquads=%u",
+                              newSquads);
+                    b[sizeof(b) - 1] = '\0'; coopLog(b);
+                } else if (coop::engine::saveGameAs("coop_risk")) {
+                    s_lastRiskSave = now;
+                    char b[144];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[save] RISK-CHECKPOINT newSquads=%u -> save 'coop_risk'",
+                              newSquads);
+                    b[sizeof(b) - 1] = '\0'; coopLog(b);
+                } else {
+                    coopErr("[save] RISK-CHECKPOINT save failed to issue");
+                }
+            }
+        }
+        } // peer-settle gate scope
         // Coordinated save + session resume (protocol 31): host-arbitrated
         // save edges, folder-quiescence completion, paced in-band folder
         // transfer, staged+verified commit on the join.
@@ -1260,8 +1322,12 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // Phase W1 (bidirectional): BOTH clients spawn/update/cull local proxies for
         // the peer's streamed ground items, keyed (ownerId, netId) so the per-sender
         // netId spaces never collide.
-        if (g_cfg.worldSync)
+        if (g_cfg.worldSync) {
             g_repl.applyWorldItems(gw, g_inbound);
+            // v46 ghost fix: remove our own copy of a save-native ground item
+            // the peer's world no longer has (picked up near a player there).
+            g_repl.applyWorldTakes(gw, g_inbound);
+        }
         // Host-authoritative world: only the JOIN hides/freezes any local NPC the
         // host isn't streaming (so the join can't run a divergent copy). The host IS
         // the world authority, so it never suppresses.
@@ -2000,6 +2066,9 @@ void installEngineDetours() {
     g_repl.setTimeSync(g_cfg.timeSync);
     g_repl.setDoorSync(g_cfg.doorSync);
     g_repl.setBuildSync(g_cfg.buildSync);
+    // v46: the SCENARIO PROXY telemetry series is harness-oracle food; only a
+    // scenario run (or KENSHICOOP_PROXY_DUMP=1) should pay its log cost.
+    g_repl.setProxyTelemetry(!g_cfg.scenario.empty());
     g_repl.setBdoorSync(g_cfg.bdoorSync);
     g_repl.setHungerSync(g_cfg.hungerSync);
     g_repl.setProdSync(g_cfg.prodSync);
@@ -2116,6 +2185,12 @@ __declspec(dllexport) void startPlugin() {
     // timestamp in this run (and every time-sync packet) shares the skewed clock.
     coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
     coop::logInit(g_cfg.logPath.c_str(), g_cfg.isHost ? "HOST" : "JOIN");
+
+    // Last-chance crash recorder: report + minidump for ANY unhandled fault on
+    // ANY thread (engine included), and a "[crash] PREVIOUS session ended in a
+    // crash" summary if artifacts from the last run are found. Installed right
+    // after the log so even a fault during hook installation is captured.
+    coop::crashguard::install(g_cfg.logPath.c_str(), g_cfg.isHost ? "HOST" : "JOIN");
 
     logStartupBanner();
 

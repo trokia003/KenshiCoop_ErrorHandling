@@ -1451,6 +1451,76 @@ int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void*
     return ok;
 }
 
+void* findGroundItemBySidNear(GameWorld* gw, const unsigned int nearHand[5],
+                              const char* sid, float radius) {
+    if (!gw || !sid || !sid[0] || !g_getObjsFn) return 0;
+    RootObject* nearRo = resolveObjectByHand(nearHand);
+    if (!nearRo) return 0;
+    void* best = 0;
+    __try {
+        Ogre::Vector3 center = nearRo->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, ITEM, 64, 0);
+        unsigned int n = g_npcQuery.size();
+        float bestD = 0.0f;
+        for (unsigned int i = 0; i < n; ++i) {
+            RootObject* o = g_npcQuery[i]; if (!o) continue;
+            Item* it = reinterpret_cast<Item*>(o);
+            if (it->isInInventory) continue; // only FREE ground copies
+            GameData* gd = 0;
+            __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+            if (!gd) continue;
+            if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - center.x, dy = p.y - center.y, dz = p.z - center.z;
+            float d = dx * dx + dy * dy + dz * dz;
+            if (!best || d < bestD) { best = it; bestD = d; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return best; }
+    return best;
+}
+
+void* findGroundItemAt(GameWorld* gw, const char* sid, float x, float y, float z,
+                       float radius, void* const* exclude, unsigned int nExclude) {
+    if (!gw || !sid || !sid[0] || !g_getObjsFn) return 0;
+    void* best = 0;
+    __try {
+        Ogre::Vector3 center(x, y, z);
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, ITEM, 64, 0);
+        unsigned int n = g_npcQuery.size();
+        float bestD = 0.0f;
+        for (unsigned int i = 0; i < n; ++i) {
+            RootObject* o = g_npcQuery[i]; if (!o) continue;
+            Item* it = reinterpret_cast<Item*>(o);
+            if (it->isInInventory) continue; // only FREE ground copies
+            bool skip = false;
+            for (unsigned int e = 0; e < nExclude && !skip; ++e)
+                if (exclude[e] == (void*)it) skip = true;
+            if (skip) continue;
+            GameData* gd = 0;
+            __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+            if (!gd) continue;
+            if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - x, dy = p.y - y, dz = p.z - z;
+            float d = dx * dx + dy * dy + dz * dz;
+            if (!best || d < bestD) { best = it; bestD = d; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return best; }
+    return best;
+}
+
+int destroyGroundItemPtr(GameWorld* gw, void* item) {
+    if (!gw || !item || !g_destroyObjFn) return 0;
+    int ok = 0;
+    __try {
+        ok = g_destroyObjFn(gw, reinterpret_cast<RootObject*>(item),
+                            /*justUnloaded*/ false, "coop-baseline-take") ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return ok;
+}
+
 // SEH-guarded: report the first EQUIPPED item worn by the object at cHand. Writes its
 // template stringID + itemType + equipped count, returns 1 if any worn item exists.
 // The inv_equip scenario uses this to drive equip/unequip on a KNOWN, race-compatible

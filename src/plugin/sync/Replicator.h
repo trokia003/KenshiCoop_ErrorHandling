@@ -234,6 +234,11 @@ public:
     // applyInventories so the re-home beats the inventory reconcile.
     void applyWeaponPickups(GameWorld* gw, Inbound& in);
 
+    // v46 ghost fix: drain received baseline TAKE notices - remove our own
+    // free same-sid ground copy nearest the taken item's last position (and
+    // retire its baseline track first so no echo TAKE fires back).
+    void applyWorldTakes(GameWorld* gw, Inbound& in);
+
     // BEFORE engine, after publishInventories (protocol 37, BOTH clients): detect a
     // COMPLETED cross-owner drag. Every tracked container (own + received) keeps a
     // per-item-total baseline; a scan (~2.5 Hz) that finds a LOSS in one container
@@ -402,6 +407,9 @@ public:
 
     // Placed-building sync master enable (KENSHICOOP_BUILD_SYNC).
     void setBuildSync(bool v) { buildSync_ = v; }
+
+    // v46: proxy telemetry (SCENARIO PROXY series) - harness scenario runs only.
+    void setProxyTelemetry(bool v) { proxyTelemetry_ = v; }
 
     // BEFORE engine (protocol 28, both clients): sample the doors of every
     // building in the session build maps (~1 Hz) and stream change-gated
@@ -584,6 +592,14 @@ public:
     // JOIN: drain received censuses into the latest-wins existence set
     // (censusHands_) consumed by enforceHostAuthority's wide-radius pass.
     void applyNpcCensus(Inbound& in);
+
+    // Checkpoint-on-risk (host): TRUE exactly once when a NEW NPC squad cohort
+    // entered the census at least 'settleMs' ago (the spawn has landed; saving
+    // mid-materialization is the thing we're insuring against, not a thing to
+    // do). The census walk arms it (publishNpcCensus); the Plugin's save layer
+    // consumes it, applies the throttle/config gates, and issues the
+    // coordinated 'coop_risk' save. outNewSquads = cohorts since last consume.
+    bool riskCheckpointDue(unsigned long settleMs, unsigned int* outNewSquads);
 
     // Camera hint channel (protocol 43, camera-anchored interest):
     //  * join: read the local camera center (engine::cameraCenter) and send
@@ -908,6 +924,15 @@ private:
     float                     censusRadius_;  // 0 = census disabled
     unsigned long             censusSendMs_;  // host: last census publish
     unsigned long             censusRecvMs_;  // join: last census arrival
+    // Checkpoint-on-risk (host): squad cohorts (hand t,c,cs - the container
+    // triple every member of a squad shares) ever seen in this session's
+    // census. The FIRST walk after a load seeds the set silently (the world's
+    // standing population is not a risk edge); each later new cohort arms
+    // riskEventMs_. Cleared by resetSession.
+    std::set<Key>             censusSquadsSeen_;
+    bool                      censusSquadsSeeded_;
+    unsigned long             riskEventMs_;   // 0 = no un-consumed risk edge
+    unsigned int              riskNewSquads_; // cohorts since last consume
     // Camera hint channel (protocol 43): join sends its camera center at
     // ~1 Hz; the host keeps the latest hint + arrival stamp (stale hints are
     // dropped from the anchor set rather than pinning interest forever).
@@ -1099,6 +1124,9 @@ private:
     std::map<std::string, std::deque<GroundWeapon> > groundedWeapons_;
     u32                               nextPickupId_;
     std::set<std::pair<u32, u32> >    appliedPickups_;
+    // v46 baseline TAKE notices (ghost fix): outbound id + inbound idempotency.
+    u32                               nextTakeId_;
+    std::set<std::pair<u32, u32> >    appliedTakes_;
 
     // Protocol 37 cross-owner transfer state.
     // xferBase_: last-known per-item totals (sid,type)->qty per tracked container - the
@@ -1317,6 +1345,10 @@ private:
         MoneyPub() : lastSent(-1), lastSendMs(0) {}
     };
     std::map<unsigned int, MoneyPub> moneyPub_;
+    // v46 shared-wallet model (join side): the last wallet value we saw or
+    // applied - local movement against it becomes the outbound DELTA. -1 =
+    // unseeded (first read seeds silently). Reset on session swap.
+    int  moneyExpected_;
     bool moneySync_;
     // Protocol 24 faction-relation sync state, per faction sid.
     // known      = our current baseline (seeded on first sight, updated on every
@@ -1388,6 +1420,23 @@ private:
     u32           buildSeqOut_;
     unsigned long buildSampleMs_;
     bool          buildSync_;
+    // Placement-capture fallback census (2026-07-28: the placeFinal detour is
+    // a VIRTUAL's base impl - wall previews override it - and its hand-resolve
+    // miss was silent, so a session's placements produced ZERO edges). Every
+    // ~2 s the incomplete-site census diffs against this seen-set; the first
+    // walk seeds the save's baked sites silently, and a later NEW site that is
+    // neither announced (ownBuilds_) nor a peer proxy (mintByLocal_) is OUR
+    // unannounced placement -> queued as a fromUi=2 edge. Cleared on reset.
+    std::set<Key> buildCensusSeen_;
+    bool          buildCensusSeeded_;
+    unsigned long buildCensusMs_;
+    // v46 baked-site progress rows (shared save-native construction sites,
+    // keyed by save-stable hand; apply side merges by MAX - no owner).
+    struct BakedRow {
+        float lastSent; unsigned long lastSendMs;
+        BakedRow() : lastSent(-1.0f), lastSendMs(0) {}
+    };
+    std::map<Key, BakedRow> bakedRows_;
     // Protocol 28 placed-door rows, keyed by (placer building key, door
     // index) - the protocol-26 DoorRow shape on the translated identity.
     struct BdoorRow {
@@ -1705,6 +1754,9 @@ private:
     // HOST: per-hand reply throttle (a re-request within the window is a
     // duplicate in flight, not a new question).
     std::map<Key, unsigned long> spawnReplyMs_;
+    // v46: proxy telemetry gate - the SCENARIO PROXY series only emits during
+    // harness scenario runs (or KENSHICOOP_PROXY_DUMP=1); free play is quiet.
+    bool          proxyTelemetry_;
     // JOIN: last "SCENARIO PROXY ..." telemetry emit (~2 Hz while proxies live).
     unsigned long spawnPosLogMs_;
 

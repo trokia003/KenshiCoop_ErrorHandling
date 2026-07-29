@@ -114,6 +114,7 @@
     <ClCompile Include="Plugin.cpp" />
     <ClCompile Include="CoopLog.cpp" />
     <ClCompile Include="core\Config.cpp" />
+    <ClCompile Include="core\CrashGuard.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="net\SteamInvite.cpp" />
@@ -192,6 +193,7 @@
   <ItemGroup>
     <ClInclude Include="CoopLog.h" />
     <ClInclude Include="core\Config.h" />
+    <ClInclude Include="core\CrashGuard.h" />
     <ClInclude Include="core\Inbound.h" />
     <ClInclude Include="net\NetLink.h" />
     <ClInclude Include="net\SteamP2P.h" />
