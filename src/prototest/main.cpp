@@ -104,7 +104,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         32);
     CHECK_EQ("sizeof(BuildRemovePacket)",       sizeof(BuildRemovePacket),       29);
     CHECK_EQ("sizeof(SaveReqPacket)",           sizeof(SaveReqPacket),           57);
-    CHECK_EQ("sizeof(SaveBeginPacket)",         sizeof(SaveBeginPacket),         67);
+    CHECK_EQ("sizeof(SaveBeginPacket)",         sizeof(SaveBeginPacket),         68); // v46: +delta
     CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          19);
     CHECK_EQ("sizeof(SaveDoneHeader)",          sizeof(SaveDoneHeader),          11);
     CHECK_EQ("sizeof(SaveAckPacket)",           sizeof(SaveAckPacket),           20);
@@ -115,6 +115,13 @@ static void testSizes() {
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
+    // v48 file push + build fingerprint: WIRE FORMAT FROZEN (cross-version
+    // bootstrap subset - the DLL update of a mismatched join parses these).
+    CHECK_EQ("sizeof(FilePushBeginPacket)",     sizeof(FilePushBeginPacket),     20);
+    CHECK_EQ("sizeof(FilePushChunkPacket)",     sizeof(FilePushChunkPacket),     15);
+    CHECK_EQ("sizeof(FilePushDonePacket)",      sizeof(FilePushDonePacket),      9);
+    CHECK_EQ("sizeof(FilePushAckPacket)",       sizeof(FilePushAckPacket),       10);
+    CHECK_EQ("sizeof(BuildInfoPacket)",         sizeof(BuildInfoPacket),         15);
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -220,7 +227,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v45: join-dealt combat-hit report)", (int)PROTOCOL_VERSION, 45);
+    CHECK_EQ("PROTOCOL_VERSION (v48: file push + build info)", (int)PROTOCOL_VERSION, 48);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------

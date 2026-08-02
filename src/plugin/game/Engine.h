@@ -334,6 +334,29 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
 bool isZoneLoadedAt(GameWorld* gw, float x, float y, float z);
 void resolveZoneQuery();
 
+// Join world-spawn veto (game/ZoneQuery.cpp - the detour target needs the
+// quarantined ZoneManager type). While armed, the ZoneManager spawn-checks
+// ticker (ambient wildlife / roaming-squad generation) is skipped entirely:
+// in a live join session the host census is the sole NPC-existence authority,
+// so every locally-generated squad is a ghost the authority pass would have to
+// chase down and hide AFTER it renders. installSpawnVetoHook installs the
+// detour (pass-through until armed); setSpawnVeto arms/disarms it per tick
+// from the session gate. spawnVetoTicks counts skipped ticker runs (evidence
+// the veto is actually intercepting; the flag is read on a zone worker thread).
+bool installSpawnVetoHook();
+void setSpawnVeto(bool on);
+unsigned long spawnVetoTicks();
+
+// Town-flavor veto (game/ZoneQuery.cpp, same regime as the world-spawn veto,
+// separate knob/counter): while armed, Town::spawnTheBarFlies is skipped - the
+// join's bars are populated by the HOST's barflies via census/spawn-info
+// proxies (the shared player faction keeps the join squad's zones simulated
+// host-side), so the local roll only ever produced ghost patrons standing
+// beside them. Functional town population (shopkeepers/guards) is not vetoed.
+bool installTownVetoHook();
+void setTownVeto(bool on);
+unsigned long townVetoCalls();
+
 // SEH-guarded (Phase 1 spawn parity): destroy a previously-minted proxy body
 // (GameWorld::destroy, true destruction). Used when the proxy's original hand
 // later resolves to a REAL engine body (baked block finished loading) - the
@@ -722,6 +745,33 @@ unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
 // (Inventory::tryAddItem of the existing object - no fabrication). The pickup mirror of
 // relocateWeaponToGround. Returns 1 on success. `item` must be a still-live tracked object.
 int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item);
+
+// SEH-guarded (ghost-gear fallback): the nearest FREE ground Item whose
+// template sid matches, within `radius` of the object at nearHand, as a void*
+// for addItemPtrToInventory - or 0. For peer pickups that carry NO drop
+// identity when NO tracked same-sid copy exists: gear already on the ground
+// when the session started (save loot, NPC-shed equipment) is tracked by
+// neither item channel, so this spatial match is the only way to remove the
+// local copy the picker just took on their machine.
+void* findGroundItemBySidNear(GameWorld* gw, const unsigned int nearHand[5],
+                              const char* sid, float radius);
+
+// SEH-guarded (v46 baseline TAKE apply): the nearest FREE ground Item with a
+// matching template sid within `radius` of an explicit world position,
+// skipping any pointer in exclude[] (peer-streamed proxies have their own
+// remove path). Returns the Item* as void*, or 0.
+void* findGroundItemAt(GameWorld* gw, const char* sid, float x, float y, float z,
+                       float radius, void* const* exclude, unsigned int nExclude);
+
+// SEH-guarded: destroy a free ground item object (GameWorld::destroy). The
+// TAKE apply removes the local ghost copy of an item the peer's world no
+// longer has on the ground. Returns 1 on success.
+int destroyGroundItemPtr(GameWorld* gw, void* item);
+
+// SEH-guarded: 1 while the Item is still a FREE ground object (not inside any
+// inventory). The proxy-pickup sweep (v47) uses the 0 edge to notify the
+// item's author that this side bagged its streamed copy.
+int itemIsFreeGround(void* item);
 
 // ---- Equipped-gear (armour/weapon slot) test hooks (inv_equip scenario) ----
 // SEH-guarded: report the first EQUIPPED item worn by the object at cHand (its
@@ -1413,6 +1463,7 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
 struct BuildRead {
     unsigned int hand[5]; // local hand [type, container, containerSerial, index, serial]
     float x, y, z;        // world position
+    float yaw;            // world yaw (radians; the peer's mint orientation)
     float progress;       // ConstructionState::constructionProgress (0..1)
     int   complete;       // ConstructionState::isComplete
     char  sid[48];        // template GameData stringID (wire identity)
@@ -1432,6 +1483,12 @@ struct BuildEdge {
 // Every successful placement queues a BuildEdge the Replicator drains.
 bool installBuildHook();
 unsigned int drainBuildEdges(BuildEdge* out, unsigned int maxOut);
+// Push a placement edge programmatically (the build-census fallback capture:
+// placeFinalPreviewBuilding is VIRTUAL and subclass previews - walls - override
+// it, so detour-missed placements are announced from the site census instead).
+// fromUi: 1 = UI detour, 0 = probe/programmatic, 2 = census-captured.
+void queueBuildEdgeRec(const unsigned int bHand[5], const char* sid,
+                       float x, float y, float z, float yaw, int fromUi);
 // SEH-guarded enumeration of INCOMPLETE construction sites among BUILDING
 // objects within radius of the interest centers (complete/baked buildings are
 // legion and never stream - only sites under construction are interesting).
@@ -1444,6 +1501,20 @@ bool readBuildingByHand(const unsigned int bHand[5], BuildRead* out);
 // Returns false on resolve failure or fault; *outAfter when non-null.
 bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
                               BuildRead* outAfter);
+// Pointer twin (v46): a MINTED building's runtime hand does not re-resolve,
+// so proxies apply progress through the Building* the mint returned instead.
+// v47 scale fix: constructionProgress counts MATERIALS CONSUMED (per-template
+// requirement), NOT a 0..1 fraction - completion fires only on wantComplete
+// (the sender's engine-complete flag), never on a progress threshold.
+bool writeBuildProgressPtr(void* building, float progress, bool wantComplete,
+                           BuildRead* outAfter);
+// Hand variant with the corrected completion semantics (real-session channels;
+// the legacy writeBuildProgressByHand keeps its harness-era behaviour).
+bool writeBuildProgressByHandEx(const unsigned int bHand[5], float progress,
+                                bool wantComplete, BuildRead* outAfter);
+// The Building* of the most recent successful placeBuildingAt (main thread
+// only; pair with the returned hand immediately after the call).
+void* lastMintedBuildingObj();
 // SEH-guarded programmatic placement by template sid at explicit coordinates
 // (the peer-side MINT primitive; completed=false mints a construction site).
 // Returns 1 placed, 0 template-miss/factory-refused, -1 fault. outHand gets

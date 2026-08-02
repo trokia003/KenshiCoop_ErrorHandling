@@ -24,7 +24,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 45;
+const u16 PROTOCOL_VERSION = 48;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -69,7 +69,18 @@ enum PacketType {
     PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
-    PKT_COMBAT_HIT       = 42 // RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_WORLD_TAKE       = 43,// RELIABLE baseline ground-item removal (v46, either direction); WorldTakePacket
+    PKT_PROD_DELTA       = 44,// RELIABLE join->host production intent (v47, baked machines); ProdDeltaPacket
+    // v48 generic file push + build fingerprint. WIRE FORMAT FROZEN (with
+    // HELLO/WELCOME): these are the bootstrap subset both sides must parse
+    // ACROSS protocol versions - the DLL auto-update of a version-mismatched
+    // join depends on it. Never relayout; add new packet types instead.
+    PKT_FILE_BEGIN       = 45,// RELIABLE file-push announce; FilePushBeginPacket + name bytes
+    PKT_FILE_CHUNK       = 46,// RELIABLE file-push chunk; FilePushChunkPacket + payload
+    PKT_FILE_DONE        = 47,// RELIABLE file-push end marker; FilePushDonePacket
+    PKT_FILE_ACK         = 48,// RELIABLE receiver verdict; FilePushAckPacket
+    PKT_BUILD_INFO       = 49 // RELIABLE build fingerprint (join -> host after WELCOME); BuildInfoPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -553,6 +564,37 @@ struct WorldPickupPacket {
     u32 refDropId;
 };
 
+// v46: removal notice for a BASELINE (save-native, never-streamed) ground item.
+// Both clients hold their own copy of such an item from the shared save; when
+// one side's copy stops being a free ground item (picked up / consumed), the
+// peer removes its nearest same-sid free copy within a small radius of the
+// item's last position. The picker's bag converges via the normal inventory
+// snapshot; this packet only prevents the ground ghost.
+struct WorldTakePacket {
+    u8   type;         // = PKT_WORLD_TAKE
+    u32  ownerId;      // network player id of the sender
+    u32  takeId;       // monotonic per-sender (idempotency)
+    char stringID[48]; // template sid of the taken item
+    float x, y, z;     // the item's last known ground position
+};
+
+// v47: join -> host production intent. Machine state (protocol 33) is host-
+// authoritative one-way, so a JOIN mining an ore deposit or working a bench
+// produced output only its local sim could see - and the host's stream then
+// overwrote it back to nothing. The join forwards the output INCREASE it
+// caused; the host lands it on the real machine, and its normal prod stream
+// echoes the authoritative result to both. v1 scope: BAKED machines only
+// (save-stable hands both sides share); session-placed machines still ride
+// host-authoritative rows alone.
+struct ProdDeltaPacket {
+    u8    type;       // = PKT_PROD_DELTA
+    u32   ownerId;    // network player id of the sender (the join)
+    u32   deltaId;    // monotonic per-sender (idempotency)
+    u32   key[5];     // BAKED machine hand [type, container, cs, index, serial]
+    float outDelta;   // output-amount increase (> 0)
+    char  outSid[48]; // output item template (diagnostics / materialize aid)
+};
+
 // ---- Protocol 37: cross-owner TRANSFER intent --------------------------------
 // A direct UI drag between two squads mutates a PEER-authored container - the one
 // write the single-writer container snapshots cannot represent (the owner would
@@ -588,6 +630,60 @@ struct InvXferPacket {
     u16  quality;    // quality*100 of the moved stack (advisory)
     char manufacturer[48];
     char material[48];
+};
+
+// ---- v48: generic in-band file push -----------------------------------------
+// One purpose-tagged channel for whole-file delivery over CH_RELIABLE, used by
+// the DLL auto-update (host -> join: the sender's KenshiCoop.dll) and MP log
+// shipping (join -> host: one finished log segment). The receiver assembles
+// chunks in memory, verifies the FNV-1a-32 CRC at DONE, dispatches by purpose
+// and answers with an ACK. WIRE FORMAT FROZEN - see the PacketType note: a
+// version-mismatched join must still be able to receive a DLL update.
+const u8  FILE_PUSH_DLL      = 1;  // payload: the sender's KenshiCoop.dll image
+const u8  FILE_PUSH_LOG      = 2;  // payload: one finished MP log segment
+const u16 FILE_PUSH_NAME_MAX = 96; // destination file NAME only (no path)
+const u16 FILE_PUSH_CHUNK_MAX = 1024;
+const u32 FILE_PUSH_SIZE_MAX  = 16u * 1024u * 1024u; // receiver assembly cap
+
+// Announce: [FilePushBeginPacket][char name[nameLen]]
+struct FilePushBeginPacket {
+    u8  type;     // = PKT_FILE_BEGIN
+    u32 ownerId;  // network player id of the sender
+    u32 xferId;   // per-sender monotonic (stale chunks dropped by mismatch)
+    u8  purpose;  // FILE_PUSH_*
+    u16 nameLen;  // file NAME bytes following (1..FILE_PUSH_NAME_MAX, no path)
+    u32 size;     // total payload bytes (<= FILE_PUSH_SIZE_MAX)
+    u32 crc;      // FNV-1a-32 over the full payload
+};
+// Chunk: [FilePushChunkPacket][u8 data[dataLen]]
+struct FilePushChunkPacket {
+    u8  type;     // = PKT_FILE_CHUNK
+    u32 ownerId;
+    u32 xferId;   // matching FilePushBeginPacket.xferId
+    u32 offset;   // byte offset within the payload
+    u16 dataLen;  // payload bytes following (1..FILE_PUSH_CHUNK_MAX)
+};
+struct FilePushDonePacket {
+    u8  type;     // = PKT_FILE_DONE
+    u32 ownerId;
+    u32 xferId;
+};
+struct FilePushAckPacket {
+    u8  type;     // = PKT_FILE_ACK
+    u32 ownerId;  // network player id of the sender (the receiver of the file)
+    u32 xferId;   // the transfer being answered
+    u8  ok;       // 1 = CRC verified + applied/stored; 0 = failed/rejected
+};
+// Build fingerprint (join -> host right after WELCOME): lets the host detect
+// same-protocol build drift (staged fixes without a version bump) and push its
+// DLL. On a protocol MISMATCH the host never sends WELCOME - it pushes the DLL
+// straight from the HELLO edge instead (the join's BUILD_INFO never fires).
+struct BuildInfoPacket {
+    u8  type;     // = PKT_BUILD_INFO
+    u32 ownerId;
+    u16 protoVer; // sender's PROTOCOL_VERSION (redundant with HELLO; diagnostic)
+    u32 dllCrc;   // FNV-1a-32 of the sender's own loaded DLL file
+    u32 dllSize;  // its byte size (cheap pre-filter + diagnostics)
 };
 
 // Reserved netId meaning "no/invalid world item".
@@ -1064,6 +1160,11 @@ struct SaveBeginPacket {
     char name[48];  // save name (the join stages save/<name>__incoming/)
     u16  fileCount; // files that will follow
     unsigned __int64 totalBytes; // sum of file sizes (progress + sanity)
+    // v46 DELTA transfers: 1 = only files changed since the last ACKed
+    // transfer of this save follow; the receiver merges them ONTO its
+    // committed copy instead of swap-replacing the folder. 0 = full send
+    // (first transfer, a file was deleted sender-side, or post-reconnect).
+    u8   delta;
 };
 
 // Host -> join: one chunk of one file. Variable length:

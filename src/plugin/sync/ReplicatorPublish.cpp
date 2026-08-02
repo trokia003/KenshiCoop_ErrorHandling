@@ -281,7 +281,21 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             bool fought   = attackerOf_.find(k) != attackerOf_.end();
             bool down     = coop::bodyIsDown(e.bodyState) ||
                             (e.bodyState & BODY_DEAD) != 0;
-            if (fighting || fought || down) medNpc_[k] = nowPub;
+            // v46 wake-heal fix: qualification used to END the instant a KO'd
+            // NPC stood up (down=false, fighting=false), so the vitals stream
+            // quit exactly when the join's copy needed its post-coma wounds
+            // corrected - recovered enemies rendered fully healed there. Keep
+            // a recovered body qualified for a grace window past its last
+            // down sighting so the standing-up state streams too.
+            const unsigned long WAKE_GRACE_MS = 30000;
+            if (down) medDownLatch_[k] = nowPub;
+            bool recentlyDown = false;
+            {
+                std::map<Key, unsigned long>::iterator dl = medDownLatch_.find(k);
+                recentlyDown = (dl != medDownLatch_.end() &&
+                                nowPub - dl->second <= WAKE_GRACE_MS);
+            }
+            if (fighting || fought || down || recentlyDown) medNpc_[k] = nowPub;
         }
         // A combat intent's SUBJECT is a victim; if it's a world NPC (not a
         // player-squad body - those have their own owner-authoritative stream),
@@ -298,6 +312,12 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
              mit != medNpc_.end(); ) {
             if (nowPub - mit->second > MEDNPC_STALE_MS) medNpc_.erase(mit++);
             else ++mit;
+        }
+        // Age out the wake-grace latches too (bounded across brawls).
+        for (std::map<Key, unsigned long>::iterator dit = medDownLatch_.begin();
+             dit != medDownLatch_.end(); ) {
+            if (nowPub - dit->second > 30000) medDownLatch_.erase(dit++);
+            else ++dit;
         }
     }
 
@@ -646,6 +666,36 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     net.queueNpcCensus(ownerId, hands, poss, n);
 
+    // Checkpoint-on-risk arming: reduce this walk to its squad COHORTS (the
+    // hand container triple all members of one squad share - the 2026-07-22
+    // crash squad was 12 bodies, ONE cohort 1,55,3348510720) and arm a risk
+    // edge for every cohort this session has never census'd before. The first
+    // walk after a load seeds silently: the standing world population is not
+    // a spawn-in. Consumed by riskCheckpointDue after its settle window.
+    {
+        unsigned int newCohorts = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            Key sq;
+            sq.t  = states[i].hType;
+            sq.c  = states[i].hContainer;
+            sq.cs = states[i].hContainerSerial;
+            sq.i  = 0; sq.s = 0; // cohort key: container triple only
+            if (censusSquadsSeen_.insert(sq).second && censusSquadsSeeded_)
+                ++newCohorts;
+        }
+        if (!censusSquadsSeeded_) {
+            censusSquadsSeeded_ = true;
+        } else if (newCohorts > 0) {
+            if (riskEventMs_ == 0) riskEventMs_ = now;
+            riskNewSquads_ += newCohorts;
+            char rb[128];
+            _snprintf(rb, sizeof(rb) - 1,
+                      "[census] NEW-SQUAD cohorts=%u (risk edge armed, pending=%u)",
+                      newCohorts, riskNewSquads_);
+            rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+        }
+    }
+
     // Phase 2 mid-band tier: rebuild the round-robin list from this census
     // walk. Everything beyond the stream bubble's KEEP band belongs to the
     // mid tier; nearest-first so a MAX_PUBLISH squeeze drops the farthest.
@@ -734,6 +784,16 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
     }
+}
+
+bool Replicator::riskCheckpointDue(unsigned long settleMs, unsigned int* outNewSquads) {
+    if (riskEventMs_ == 0) return false;
+    unsigned long now = nowMs();
+    if ((now - riskEventMs_) < settleMs) return false; // let the spawn land first
+    if (outNewSquads) *outNewSquads = riskNewSquads_;
+    riskEventMs_   = 0;
+    riskNewSquads_ = 0;
+    return true;
 }
 
 void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,

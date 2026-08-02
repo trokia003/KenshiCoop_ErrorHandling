@@ -411,6 +411,37 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     // ---- Stream new/changed + HANDLE-based cull over every track -----------
     WorldItemEntry send[WORLD_ITEMS_MAX]; unsigned int ns = 0;
     u32 removed[256]; unsigned int nr = 0;
+    // v46 adoption retractions: tracks we streamed and then handed over to the
+    // peer's stream (native-twin adoption in applyWorldItems) - the REMOVE
+    // despawns whatever proxy the peer already minted from our rows.
+    for (size_t ri = 0; ri < retractNetIds_.size() && nr < 256; ++ri)
+        removed[nr++] = retractNetIds_[ri];
+    retractNetIds_.clear();
+
+    // v47 proxy-pickup sweep (the "his pickups leave my items behind" report):
+    // a PEER-authored proxy that stopped being a FREE ground item was bagged
+    // on THIS machine - the one conservation direction nothing covered for
+    // non-gear items. Tell the author via WORLD_TAKE (its TAKE apply removes
+    // the real copy near the spot) and drop the mapping NOW, so the author's
+    // eventual REMOVE can't destroy the item out of the picker's inventory.
+    for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
+         pi != worldProxies_.end(); ) {
+        WorldProxy& wp = pi->second;
+        if (!wp.sid[0] || engine::itemIsFreeGround((void*)wp.obj)) { ++pi; continue; }
+        WorldTakePacket tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.type    = (u8)PKT_WORLD_TAKE;
+        tp.ownerId = ownerId;
+        tp.takeId  = ++nextTakeId_;
+        strncpy(tp.stringID, wp.sid, sizeof(tp.stringID) - 1);
+        tp.x = wp.x; tp.y = wp.y; tp.z = wp.z;
+        net.queueWorldTake(tp);
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[wi] PROXY-PICKED sid='%s' owner=%u netId=%u -> TAKE id=%u",
+            wp.sid, pi->first.first, pi->first.second, tp.takeId);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        worldProxies_.erase(pi++);
+    }
     for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ) {
         WorldTrack& tr = it->second;
         unsigned int ihand[5] = { it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s };
@@ -421,6 +452,37 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
             // no proxy to remove - just drop our track. Streamed tracks emit a
             // remove so the peer despawns its proxy.
             if (!tr.baseline) { if (nr < 256) removed[nr++] = tr.netId; }
+            else {
+                // v46 ghost fix: the peer holds ITS OWN copy of this save-native
+                // item, and nothing else ever removes it - the "I picked it up
+                // but he still sees it" report. Broadcast a TAKE only when a
+                // player is near the item's last spot (the pickup shape); a
+                // far-away death is a zone unload, and taking the peer's still
+                // -loaded live copy for that would be a wipe.
+                float anchors[12];
+                unsigned int na = engine::interestAnchors(gw, anchors);
+                bool nearPlayer = false;
+                for (unsigned int a = 0; a < na && !nearPlayer; ++a) {
+                    float dx = tr.x - anchors[a * 3 + 0];
+                    float dy = tr.y - anchors[a * 3 + 1];
+                    float dz = tr.z - anchors[a * 3 + 2];
+                    nearPlayer = (dx * dx + dy * dy + dz * dz) <= (60.0f * 60.0f);
+                }
+                if (nearPlayer) {
+                    WorldTakePacket tp;
+                    memset(&tp, 0, sizeof(tp));
+                    tp.type    = (u8)PKT_WORLD_TAKE;
+                    tp.ownerId = ownerId;
+                    tp.takeId  = ++nextTakeId_;
+                    strncpy(tp.stringID, tr.stringID, sizeof(tp.stringID) - 1);
+                    tp.x = tr.x; tp.y = tr.y; tp.z = tr.z;
+                    net.queueWorldTake(tp);
+                    char b[176]; _snprintf(b, sizeof(b) - 1,
+                        "[wi] TAKE-SEND id=%u sid='%s' pos=%.1f,%.1f,%.1f",
+                        tp.takeId, tp.stringID, tp.x, tp.y, tp.z);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
             if (dumpWi) { char b[112]; _snprintf(b, sizeof(b) - 1,
                 "[wi] CULL netId=%u (gone/picked-up) baseline=%d", tr.netId, tr.baseline ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
@@ -480,16 +542,57 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
             std::pair<u32, u32> pk(b->ownerId, e->netId);
             std::map<std::pair<u32, u32>, WorldProxy>::iterator pit = worldProxies_.find(pk);
             if (pit == worldProxies_.end()) {
-                RootObject* obj = engine::spawnWorldItemProxy(gw, e->stringID, e->itemType,
-                                                              (int)e->quantity, e->x, e->y, e->z);
+                // v46 native-twin ADOPTION (the "items duplicate when we both
+                // walk near them" report): a save-native item discovered
+                // MID-SESSION (outside the load-time baseline's small radius)
+                // is streamed by BOTH machines, and blindly minting here put a
+                // proxy on top of our own native copy - a visible duplicate on
+                // both screens. A FREE local same-sid item within twin radius
+                // of the row's position IS our copy of the same item: bind it
+                // as this row's proxy body instead of spawning, and hand over
+                // authorship (drop our own track for it; a REMOVE retracts any
+                // rows we already streamed so the peer's mint despawns too).
+                RootObject* obj = 0;
+                bool adopted = false;
+                {
+                    void* excl[128]; unsigned int nEx = 0;
+                    for (std::map<std::pair<u32, u32>, WorldProxy>::iterator xi =
+                             worldProxies_.begin();
+                         xi != worldProxies_.end() && nEx < 128; ++xi)
+                        excl[nEx++] = (void*)xi->second.obj;
+                    void* twin = engine::findGroundItemAt(gw, e->stringID,
+                                                          e->x, e->y, e->z,
+                                                          3.0f, excl, nEx);
+                    if (twin) {
+                        obj = reinterpret_cast<RootObject*>(twin);
+                        adopted = true;
+                        for (std::map<Key, WorldTrack>::iterator wt = worldTrack_.begin();
+                             wt != worldTrack_.end(); ++wt) {
+                            unsigned int h[5] = { wt->first.t, wt->first.c,
+                                                  wt->first.cs, wt->first.i,
+                                                  wt->first.s };
+                            if ((void*)engine::resolveObjectByHand(h) != twin) continue;
+                            if (!wt->second.baseline && wt->second.lastSendMs != 0)
+                                retractNetIds_.push_back(wt->second.netId);
+                            worldTrack_.erase(wt);
+                            break;
+                        }
+                    }
+                }
+                if (!obj)
+                    obj = engine::spawnWorldItemProxy(gw, e->stringID, e->itemType,
+                                                      (int)e->quantity, e->x, e->y, e->z);
                 if (obj) {
                     WorldProxy wp; wp.obj = obj; wp.x = e->x; wp.y = e->y; wp.z = e->z; wp.hash = 0;
+                    strncpy(wp.sid, e->stringID, sizeof(wp.sid) - 1);
+                    wp.sid[sizeof(wp.sid) - 1] = '\0';
                     worldProxies_[pk] = wp;
                 }
-                char b2[200]; _snprintf(b2, sizeof(b2) - 1,
-                    "[wi] SPAWN owner=%u netId=%u ok=%d sid='%s' pos=%.2f,%.2f,%.2f",
+                char b2[208]; _snprintf(b2, sizeof(b2) - 1,
+                    "[wi] %s owner=%u netId=%u ok=%d sid='%s' pos=%.2f,%.2f,%.2f",
+                    adopted ? "ADOPT" : "SPAWN",
                     b->ownerId, e->netId, obj ? 1 : 0, e->stringID, e->x, e->y, e->z);
-                b2[sizeof(b2) - 1] = '\0'; if (dumpWi || !obj) coop::logLine(b2);
+                b2[sizeof(b2) - 1] = '\0'; if (dumpWi || !obj || adopted) coop::logLine(b2);
             } else {
                 WorldProxy& wp = pit->second;
                 float dx = e->x - wp.x, dy = e->y - wp.y, dz = e->z - wp.z;
@@ -743,6 +846,48 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
     }
 }
 
+void Replicator::applyWorldTakes(GameWorld* gw, Inbound& in) {
+    std::deque<InboundWorldTake> got;
+    in.drainWorldTakes(got);
+    if (got.empty()) return;
+    for (std::deque<InboundWorldTake>::iterator it = got.begin(); it != got.end(); ++it) {
+        const WorldTakePacket& p = it->pkt;
+        std::pair<u32, u32> id(p.ownerId, p.takeId);
+        if (appliedTakes_.count(id) != 0) continue; // idempotent (reliable resend)
+        appliedTakes_.insert(id);
+        if (appliedTakes_.size() > 4096) appliedTakes_.erase(appliedTakes_.begin());
+        // Never take a peer-streamed proxy: those carry netId identities and are
+        // removed by their own WORLD_ITEM_REMOVE path.
+        void* exclude[128]; unsigned int nEx = 0;
+        for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
+             pi != worldProxies_.end() && nEx < 128; ++pi)
+            exclude[nEx++] = (void*)pi->second.obj;
+        void* victim = engine::findGroundItemAt(gw, p.stringID, p.x, p.y, p.z,
+                                                24.0f, exclude, nEx);
+        int destroyed = 0;
+        if (victim) {
+            // Retire OUR baseline track of this copy FIRST (by object identity),
+            // so its own liveness death never echoes a TAKE back at the sender.
+            for (std::map<Key, WorldTrack>::iterator wt = worldTrack_.begin();
+                 wt != worldTrack_.end(); ++wt) {
+                if (!wt->second.baseline) continue;
+                if (strcmp(wt->second.stringID, p.stringID) != 0) continue;
+                unsigned int h[5] = { wt->first.t, wt->first.c, wt->first.cs,
+                                      wt->first.i, wt->first.s };
+                if ((void*)engine::resolveObjectByHand(h) == victim) {
+                    worldTrack_.erase(wt);
+                    break;
+                }
+            }
+            destroyed = engine::destroyGroundItemPtr(gw, victim);
+        }
+        char b[192]; _snprintf(b, sizeof(b) - 1,
+            "[wi] TAKE-APPLY id=%u sid='%s' pos=%.1f,%.1f,%.1f destroyed=%d",
+            p.takeId, p.stringID, p.x, p.y, p.z, destroyed);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
     std::deque<InboundWorldDrop> got;
     in.drainWorldDrops(got);
@@ -808,15 +953,31 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
         } else if (!q.empty()) {
             pick = q.begin(); // legacy/no-identity: fall back to oldest same-sid copy
         }
+        int ghostFb = 0;
         if (pick != q.end()) {
             void* item = pick->item;
             moved = engine::addItemPtrToInventory(gw, targetHand, item);
             if (moved) q.erase(pick); // re-homed; stop tracking it on the ground
+        } else if (p.refDropId == 0) {
+            // Ghost-gear fallback: gear already on the ground when the session
+            // started (save loot, NPC-shed equipment) is tracked by NEITHER
+            // channel, so the picker sends ref=0/0 and there is no tracked
+            // copy here - this side's ghost used to stay lying (pickable = the
+            // item-dup report). With ZERO tracked same-sid copies the identity
+            // system has nothing to protect: any FREE same-sid ground item
+            // near the picker IS the untracked shared-save copy - re-home the
+            // nearest. (Tracked duplicates still follow the strict rule above.)
+            void* item = engine::findGroundItemBySidNear(gw, targetHand,
+                                                         p.stringID, 80.0f);
+            if (item) {
+                moved = engine::addItemPtrToInventory(gw, targetHand, item);
+                ghostFb = 1;
+            }
         }
         char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u moved=%d trackedLeft=%u",
+            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u moved=%d trackedLeft=%u ghostFb=%d",
             p.pickupId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
-            p.oSerial, p.refDropOwnerId, p.refDropId, moved, (unsigned)q.size());
+            p.oSerial, p.refDropOwnerId, p.refDropId, moved, (unsigned)q.size(), ghostFb);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // Keep the transfer detector blind to the relocation we just made.
         Key tk; tk.t = p.oType; tk.c = p.oContainer; tk.cs = p.oContainerSerial;
@@ -966,8 +1127,15 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
 
     for (unsigned int i = 0; i < fires.size(); ++i) {
         const Fire& f = fires[i];
-        bool srcOwn = ownedContainers_.count(f.src) != 0 || ownHands_.count(f.src) != 0;
-        bool dstOwn = ownedContainers_.count(f.dst) != 0 || ownHands_.count(f.dst) != 0;
+        // Census-authored world containers (protocol 34, host) count as OWN:
+        // our snapshots carry their state, so a local diff there needs no
+        // intent. Omitting them made the host author bogus chest->chest
+        // intents and latch against containers it streams (2026-08-01 logs:
+        // '[xfer] defer-expired ... unadjudicated local diff' churn).
+        bool srcOwn = ownedContainers_.count(f.src) != 0 || ownHands_.count(f.src) != 0 ||
+                      censusContainers_.count(f.src) != 0;
+        bool dstOwn = ownedContainers_.count(f.dst) != 0 || ownHands_.count(f.dst) != 0 ||
+                      censusContainers_.count(f.dst) != 0;
         if (!srcOwn || !dstOwn) {
             // At least one end is peer-authored: the single-writer snapshots cannot
             // carry this move - author the reliable transfer intent.
@@ -1067,8 +1235,12 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, u32 localId) {
         XKey key(std::string(p.stringID), p.itemType);
         // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its
         // owner before this transfer) must not reconcile the relocation away.
-        bool srcOwn = ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0;
-        bool dstOwn = ownedContainers_.count(dk) != 0 || ownHands_.count(dk) != 0;
+        // Census-authored containers count as OWN (no latch needed - the applied
+        // move lands in our next authoritative snapshot of them).
+        bool srcOwn = ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0 ||
+                      censusContainers_.count(sk) != 0;
+        bool dstOwn = ownedContainers_.count(dk) != 0 || ownHands_.count(dk) != 0 ||
+                      censusContainers_.count(dk) != 0;
         int applied = moved + fab;
         if (applied > 0) {
             if (!srcOwn) {

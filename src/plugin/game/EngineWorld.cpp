@@ -107,25 +107,69 @@ unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut
 
 bool readWalletByHand(const unsigned int mHand[5], int* outMoney) {
     if (outMoney) *outMoney = -1;
-    if (!mHand || !outMoney || !g_ownGetMoneyFn) return false;
+    if (!mHand || !outMoney) return false;
     Character* c = resolveCharByHand(mHand[3], mHand[4], mHand[0], mHand[1], mHand[2]);
     if (!c) return false;
     __try {
+        // Character::getMoney is the engine's OWN display/spend read - it
+        // resolves the canonical wallet for the body's group. The 2026-07-28
+        // live sessions showed the legacy Ownerships::money chain reads 0 on
+        // BOTH clients' real saves while the players demonstrably hold cats,
+        // so this virtual is now the primary getter.
+        int viaChar = -1;
+        __try { viaChar = c->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        // One-shot probe: compare the sources the first few reads so a session
+        // log settles where this save keeps its cats.
+        static int s_probeLeft = 3; // main-thread only
+        if (s_probeLeft > 0) {
+            --s_probeLeft;
+            int viaOwn = -1;
+            __try {
+                Ownerships* ow = walletOf(c);
+                if (ow && g_ownGetMoneyFn) viaOwn = g_ownGetMoneyFn(ow);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[money] wallet-probe char=%d ownerships=%d",
+                      viaChar, viaOwn);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (viaChar >= 0) { *outMoney = viaChar; return true; }
+        // Fallback: the legacy Ownerships chain (pre-fix behaviour).
         Ownerships* ow = walletOf(c);
-        if (!ow) return false;
+        if (!ow || !g_ownGetMoneyFn) return false;
         *outMoney = g_ownGetMoneyFn(ow);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool writeWalletByHand(const unsigned int mHand[5], int money) {
-    if (!mHand || money < 0 || !g_ownSetMoneyFn) return false;
+    if (!mHand || money < 0) return false;
     Character* c = resolveCharByHand(mHand[3], mHand[4], mHand[0], mHand[1], mHand[2]);
     if (!c) return false;
     __try {
+        // Verify-driven write ladder. Step 1: the legacy Ownerships setter.
+        // Step 2: read back through Character::getMoney (the canonical read);
+        // if the write did not land there, apply the remaining DELTA through
+        // Character::takeMoney - the engine's own spend primitive, which by
+        // definition moves the wallet the game actually uses (negative n
+        // credits; SEH-guarded, verified again). A still-standing mismatch is
+        // logged loudly instead of silently desyncing.
         Ownerships* ow = walletOf(c);
-        if (!ow) return false;
-        g_ownSetMoneyFn(ow, money);
+        if (ow && g_ownSetMoneyFn) g_ownSetMoneyFn(ow, money);
+        int got = -1;
+        __try { got = c->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (got == money || got < 0) return true; // landed (or unverifiable)
+        __try { c->takeMoney(got - money); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        int got2 = -1;
+        __try { got2 = c->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (got2 != money) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[money] APPLY verify want=%d ownSet->%d takeDelta->%d",
+                      money, got, got2);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -487,6 +531,9 @@ static void fillBuildRead(Building* b, BuildRead* r) {
     readObjectHand(ro, r->hand);
     Ogre::Vector3 p = ro->getPosition();
     r->x = p.x; r->y = p.y; r->z = p.z;
+    // World yaw for the census-capture announce path (the peer mints at this
+    // orientation; the UI detour reads the preview's own yaw instead).
+    r->yaw = ro->getOrientation().getYaw().valueRadians();
     r->progress = b->_buildState.constructionProgress;
     r->complete = b->_buildState.isComplete ? 1 : 0;
     GameData* gd = ro->getGameData();
@@ -496,6 +543,19 @@ static void fillBuildRead(Building* b, BuildRead* r) {
         strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
         r->name[sizeof(r->name) - 1] = '\0';
     }
+}
+
+void queueBuildEdgeRec(const unsigned int bHand[5], const char* sid,
+                       float x, float y, float z, float yaw, int fromUi) {
+    if (!bHand || !sid || !sid[0]) return;
+    BuildEdgeRec e;
+    memset(&e, 0, sizeof(e));
+    memcpy(e.hand, bHand, sizeof(e.hand));
+    strncpy(e.sid, sid, sizeof(e.sid) - 1);
+    e.sid[sizeof(e.sid) - 1] = '\0';
+    e.x = x; e.y = y; e.z = z; e.yaw = yaw;
+    e.fromUi = fromUi;
+    if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
 }
 
 unsigned int enumSitesNear(GameWorld* gw, float radius, BuildRead* out, unsigned int maxOut) {
@@ -566,9 +626,58 @@ bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
     }
 }
 
+bool writeBuildProgressPtr(void* building, float progress, bool wantComplete,
+                           BuildRead* outAfter) {
+    // Pointer twin of writeBuildProgressByHand for MINTED buildings (runtime
+    // hands do not re-resolve). SCALE (2026-07-31 one-plate-completed-it
+    // session): constructionProgress counts MATERIALS CONSUMED, not a 0..1
+    // fraction - a refinery completes at 6.0, a storm shack at 16.0. The old
+    // ">= 1.0 fire completion" rule (a harness-fixture assumption) therefore
+    // force-completed real buildings at their FIRST material. Completion now
+    // happens ONLY when the sender's engine said complete (wantComplete); the
+    // notification lets the engine set its own full progress, so no raw write
+    // accompanies it.
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!building || !g_buildSetProgFn) return false;
+    __try {
+        Building* b = reinterpret_cast<Building*>(building);
+        if (!b->_buildState.isComplete) {
+            if (wantComplete) {
+                if (g_buildNotifyDoneFn) g_buildNotifyDoneFn(b);
+            } else {
+                g_buildSetProgFn(b, progress);
+            }
+        }
+        if (outAfter) fillBuildRead(b, outAfter);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[build] progress-write(ptr) SEH-except");
+        return false;
+    }
+}
+
+bool writeBuildProgressByHandEx(const unsigned int bHand[5], float progress,
+                                bool wantComplete, BuildRead* outAfter) {
+    // Hand variant with the corrected completion semantics (see the Ptr twin).
+    // The legacy writeBuildProgressByHand keeps its >=1.0 rule for the harness
+    // probes whose fixtures it was tuned on; REAL-session channels use this.
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!bHand || !g_buildSetProgFn) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    return writeBuildProgressPtr((void*)static_cast<Building*>(ro), progress,
+                                 wantComplete, outAfter);
+}
+
+// The Building* of the most recent successful placeBuildingAt (main thread
+// only; the caller pairs it with the returned hand immediately).
+static void* g_lastMintObj = 0;
+void* lastMintedBuildingObj() { return g_lastMintObj; }
+
 int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
                     float heading, bool completed, unsigned int outHand[5]) {
     if (outHand) memset(outHand, 0, 5 * sizeof(unsigned int));
+    g_lastMintObj = 0;
     if (!gw || !gw->theFactory || !g_createBldgFn || !sid || !sid[0]) return 0;
     GameData* tmpl = findItemTemplateImpl(gw, sid, (unsigned int)BUILDING);
     if (!tmpl) {
@@ -579,12 +688,39 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
     }
     __try {
         Ogre::Quaternion rot(Ogre::Radian(heading), Ogre::Vector3::UNIT_Y);
-        Ogre::Vector3 pos(x, y, z); // createBuilding re-grounds vertically
+        // HEIGHT SEMANTICS (2026-07-30 sky-refinery session): createBuilding
+        // treats the incoming Y as TERRAIN-RELATIVE - a mint fed the placer's
+        // ABSOLUTE height landed exactly terrain-height too high (778.3 in,
+        // 1549.8 out over ~771.5 terrain; the harness fixture sits near y=0,
+        // which hid it). Self-calibrate instead of guessing the terrain:
+        // place at 0 (engine grounds it), read back where it landed, and if
+        // that differs from the requested absolute Y beyond tolerance,
+        // re-place with the measured correction - exact on any terrain.
+        Ogre::Vector3 pos(x, 0.0f, z);
         Building* bld = g_createBldgFn(
             gw->theFactory, tmpl, pos, /*town*/0, /*owner*/0, rot, /*cb*/0,
             /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
             /*invisible*/false, completed, /*isFoliage*/false,
             /*floor*/0, /*isOutsideFurniture*/false);
+        if (bld) {
+            float landedY = static_cast<RootObject*>(bld)->getPosition().y;
+            float dy = y - landedY;
+            if ((dy > 1.5f || dy < -1.5f) && g_destroyObjFn) {
+                g_destroyObjFn(gw, static_cast<RootObject*>(bld),
+                               /*justUnloaded*/false, "coop-mint-height-recal");
+                Ogre::Vector3 pos2(x, dy, z);
+                bld = g_createBldgFn(
+                    gw->theFactory, tmpl, pos2, /*town*/0, /*owner*/0, rot, /*cb*/0,
+                    /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
+                    /*invisible*/false, completed, /*isFoliage*/false,
+                    /*floor*/0, /*isOutsideFurniture*/false);
+                char hb[144];
+                _snprintf(hb, sizeof(hb) - 1,
+                          "[build] mint height recal: want=%.1f grounded=%.1f offs=%.1f ok=%d",
+                          y, landedY, dy, bld ? 1 : 0);
+                hb[sizeof(hb) - 1] = '\0'; coop::logLine(hb);
+            }
+        }
         if (!bld) {
             char b[160];
             _snprintf(b, sizeof(b) - 1,
@@ -594,6 +730,7 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
             return 0;
         }
         RootObject* ro = static_cast<RootObject*>(bld);
+        g_lastMintObj = (void*)bld;
         unsigned int h[5] = { 0, 0, 0, 0, 0 };
         bool haveHand = readObjectHand(ro, h);
         if (outHand && haveHand) memcpy(outHand, h, sizeof(h));
@@ -1157,9 +1294,14 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
-                if (!isContainerClassType((int)b->classType)) continue;
-                // Incomplete sites ride protocol 27 until finished.
-                if (!b->_buildState.isComplete) continue;
+                // Complete buildings must be container-class. An INCOMPLETE
+                // site is authored regardless of class: its inventory holds
+                // the construction MATERIALS (2026-08-01 session: the join's
+                // plate deposits were invisible to the host with sites
+                // excluded). Inventory-less sites drop at the caller's hasInv
+                // filter.
+                if (b->_buildState.isComplete &&
+                    !isContainerClassType((int)b->classType)) continue;
                 unsigned int h[5];
                 if (!readObjectHand(o, h)) continue;
                 bool dup = false; // the two interest spheres can overlap

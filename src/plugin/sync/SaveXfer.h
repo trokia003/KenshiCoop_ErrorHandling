@@ -83,8 +83,19 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 // Snapshot save 'name' and queue the BEGIN. Returns false when the folder is
 // missing/empty (nothing is queued). One transfer at a time; a re-begin
 // abandons the previous one (the join drops stale xferIds).
+// v46: sends a DELTA (only files changed since the peer's last ACKed transfer
+// of this save) when a manifest exists and nothing was deleted sender-side;
+// returns true WITHOUT queueing anything when the folder is byte-identical to
+// what the peer already committed ("[save] XFER-SKIP").
 bool beginSend(NetLink& net, u32 localId, const std::string& name);
+// v46: forget every per-peer delta manifest (call on the peer-disconnect edge -
+// a reconnecting peer's disk state must be re-proven by a full send).
+void resetPeerState();
 bool sending();
+// HOST: monotonic count of XFER-SKIPs (beginSend found the peer's committed
+// copy byte-identical and sent nothing - no ACK will follow). The resync
+// driver treats a skip as transfer-complete.
+u32  skipSeq();
 // Pump the active transfer (call every main-loop tick; internally throttled).
 // Logs "[save] XFER-SENT ..." and returns true on the tick the DONE goes out.
 bool tickSend(NetLink& net, u32 localId);

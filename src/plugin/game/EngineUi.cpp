@@ -24,6 +24,7 @@
 #include <windows.h>
 
 #include "../core/SteamId.h" // parseSteamId64 (pure) for the paste-from-clipboard button
+#include "../core/Config.h"  // savePeerToFile (persist a validated friend code)
 
 namespace coop {
 namespace engine {
@@ -209,6 +210,8 @@ DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
 DataPanelLine_Button*   g_pasteIdBtn   = 0; // "Paste friend's Steam ID" from clipboard
+DataPanelLine_Button*   g_resyncBtn    = 0; // host+peer only: coordinated save+reload
+bool                    g_resyncClicked = false; // click edge, drained end-of-tick
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
 DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
@@ -270,6 +273,10 @@ void onPasteIdBtn(DataPanelLine*) {
         _snprintf(b, sizeof(b) - 1, "[coop-ui] paste friend id=%llu ok=1", id);
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
+        // Remember the friend: a VALIDATED paste writes coop_config.json, so
+        // every later launch has this code pre-loaded (the paste becomes a
+        // one-time step per friendship instead of per session).
+        coop::savePeerToFile(id);
     } else {
         g_pasteFailed = true;
         coop::logLine("[coop-ui] paste friend id=0 ok=0 (clipboard not a Steam ID)");
@@ -277,11 +284,17 @@ void onPasteIdBtn(DataPanelLine*) {
     g_panel.needsRebuild = true;
 }
 
+void onResyncBtn(DataPanelLine*) {
+    g_resyncClicked = true; // validated + forwarded at end of coopPanelTick
+    coop::logLine("[coop-ui] RESYNC clicked");
+}
+
 // POD-only pointer bundle so the row-build SEH frame constructs no std::string.
 struct PanelStrings {
     const std::string *title, *roleKey, *roleCap, *transKey, *transCap;
     const std::string *connKey, *connCap;
     const std::string *dbgKey, *dbgVal;
+    const std::string *resyncKey, *resyncCap; // null = row hidden (not host / no peer)
     const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
     const std::string *empty;
@@ -297,6 +310,10 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         p->addSpace(0, 0.35f);
         // Connection-status debug line (coloured white below, outside SEH).
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
+        // Resync (host with live peer only; hidden otherwise).
+        g_resyncBtn = 0;
+        if (s->resyncKey)
+            g_resyncBtn = p->setLineButton(*s->resyncKey, *s->resyncCap, 0);
         p->addSpace(0, 0.35f);
         // Friend's SteamID: pasted in-panel (Copy on their side -> Paste here).
         g_peerLine = p->setLine(*s->peerKey, *s->peerVal, *s->empty, 0, false, true);
@@ -349,7 +366,7 @@ void panelDestroySeh(ForgottenGUI* g, DatapanelGUI* p) {
 } // namespace
 
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect) {
+                   CoopDisconnectFn onDisconnect, CoopResyncFn onResync) {
     if (!st) return;
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
     { static void* s_last = (void*)-1;
@@ -371,6 +388,9 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     // F2 rising edge toggles the panel open/closed.
     bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
     if (f2 && !g_panel.f2Down) {
+        // Kenshi's own keymap reacts to this keypress too (it unpaused a
+        // paused game) - swallow user pause/speed writes for a beat.
+        g_uiKeyGuardUntil = GetTickCount() + 350;
         if (!g_panel.open) {
             g_panel.hostFlag      = st->isHost;
             g_panel.steamFlag     = (st->transportSel == 0);
@@ -384,7 +404,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
-            g_pasteIdBtn = 0;
+            g_pasteIdBtn = 0; g_resyncBtn = 0;
             g_debugLine = 0; g_peerLine = 0; g_selfLine = 0;
             g_panel.open = false;
             coop::logLine("[coop-ui] panel closed");
@@ -403,6 +423,15 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         g_panel.connectedFlag = st->running;
         g_panel.lastChkVal    = st->running;
         g_panel.needsRebuild = true;
+    }
+
+    // The Resync row appears/disappears with peer presence - rebuild on the edge.
+    {
+        static bool s_lastPeer = false;
+        if (st->peerPresent != s_lastPeer) {
+            s_lastPeer = st->peerPresent;
+            g_panel.needsRebuild = true;
+        }
     }
 
     std::string detail = st->detail ? std::string(st->detail) : std::string();
@@ -460,6 +489,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         // screen overlay, so surface the live progress here instead (amber).
         if (!transfer.empty()) { dbgVal = transfer; dbgKey = "World transfer"; }
 
+        // Resync row: host with a live peer only (REAL session state, not the
+        // armed toggles - the row is an action on the running session).
+        bool showResync = st->running && st->peerPresent && st->isHost;
+        std::string resyncKey = "resync";
+        std::string resyncCap = "Resync: save + reload both worlds";
+
         // Friend's SteamID: prefer the value pasted in-panel this session; fall
         // back to the config (steamPeer, mainly for advanced/back-compat use).
         std::string peerKey = "Friend's Steam ID";
@@ -497,6 +532,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.transKey = &transKey; ps.transCap = &transCap;
         ps.connKey = &connKey; ps.connCap = &connCap;
         ps.dbgKey = &dbgKey; ps.dbgVal = &dbgVal;
+        ps.resyncKey = showResync ? &resyncKey : 0;
+        ps.resyncCap = showResync ? &resyncCap : 0;
         ps.peerKey = &peerKey; ps.peerVal = &peerVal;
         ps.pasteKey = &pasteKey; ps.pasteCap = &pasteCap;
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
@@ -512,6 +549,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
         if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
+        if (g_resyncBtn)  g_resyncBtn->callback  = MyGUI::newDelegate(&onResyncBtn);
         dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
         dbgColourSeh(g_peerLine, false);
         dbgColourSeh(g_selfLine, false);
@@ -539,6 +577,18 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         } else if (!g_panel.connectedFlag && st->running) {
             coop::logLine("[coop-ui] DISCONNECT requested");
             if (onDisconnect) onDisconnect();
+        }
+    }
+
+    // Resync click drain (once per click; the button only exists host-side with
+    // a live peer, but re-validate against the REAL state in case it raced a
+    // disconnect this tick).
+    if (g_resyncClicked) {
+        g_resyncClicked = false;
+        if (st->running && st->peerPresent && st->isHost) {
+            if (onResync) onResync();
+        } else {
+            coop::logLine("[coop-ui] resync ignored (needs hosting session with live peer)");
         }
     }
 }

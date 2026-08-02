@@ -80,6 +80,8 @@ public:
     // MAIN thread: queue a reliable conservation PICKUP intent (Phase W3), mirror of the
     // drop. The peer re-homes its tracked ground copy back into the character's bag.
     void queueWorldPickup(const WorldPickupPacket& pkt);
+    void queueWorldTake(const WorldTakePacket& pkt);
+    void queueProdDelta(const ProdDeltaPacket& pkt);
 
     // MAIN thread: queue a reliable cross-owner TRANSFER intent (protocol 37). The peer
     // relocates the real item between its own copies of the two containers.
@@ -152,6 +154,23 @@ public:
                        const unsigned char* data, unsigned int dataLen);
     void queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs, unsigned int count);
     void queueSaveAck(const SaveAckPacket& pkt);
+
+    // MAIN thread: v48 generic file push (CH_BULK, like the save transfer) +
+    // build fingerprint (CH_RELIABLE). BEGIN/CHUNK carry their variable tails
+    // pre-flattened; pacing lives in the FilePush sender.
+    void queueFileBegin(const FilePushBeginPacket& hdr, const char* name);
+    void queueFileChunk(const FilePushChunkPacket& hdr,
+                        const unsigned char* data, unsigned int dataLen);
+    void queueFileDone(const FilePushDonePacket& pkt);
+    void queueFileAck(const FilePushAckPacket& pkt);
+    void queueBuildInfo(const BuildInfoPacket& pkt);
+
+    // v48 DLL push handshake hold (host): when ON, a version-mismatched HELLO
+    // is HELD - the peer gets an id but no WELCOME and no disconnect, and the
+    // main thread is told (InboundVerMismatch) so it can push our DLL over the
+    // frozen FILE_* subset. When OFF the legacy reject stands. Set before
+    // start(); read by the net thread.
+    void setDllPushHold(bool on);
 
     // MAIN thread: coordinated-load packets (protocol 32). GO host -> join
     // (load this save now, fingerprint attached); REQ join -> host (a
@@ -247,6 +266,8 @@ private:
     // Reliable conservation DROP intents (Phase W2), fixed-size PODs. Guarded by outCs_.
     std::vector<WorldDropPacket> outWorldDrops_;
     std::vector<WorldPickupPacket> outWorldPickups_;
+    std::vector<WorldTakePacket>   outWorldTakes_;
+    std::vector<ProdDeltaPacket>   outProdDeltas_;
     // Reliable cross-owner transfer intents (protocol 37). Guarded by outCs_.
     std::vector<InvXferPacket>   outInvXfers_;
     // Reliable medical snapshots + treatment deltas (phase 2). Guarded by outCs_.
@@ -287,6 +308,16 @@ private:
     std::vector<OutSaveFile>     outSaveFile_;
     std::vector<OutSaveDone>     outSaveDone_;
     std::vector<SaveAckPacket>   outSaveAck_;
+    // v48 file push (BEGIN/CHUNK carry variable tails) + build fingerprint.
+    // Guarded by outCs_.
+    struct OutFileBegin { FilePushBeginPacket hdr; std::vector<u8> tail; };
+    struct OutFileChunk { FilePushChunkPacket hdr; std::vector<u8> tail; };
+    std::vector<OutFileBegin>       outFileBegin_;
+    std::vector<OutFileChunk>       outFileChunk_;
+    std::vector<FilePushDonePacket> outFileDone_;
+    std::vector<FilePushAckPacket>  outFileAck_;
+    std::vector<BuildInfoPacket>    outBuildInfo_;
+    volatile LONG dllPushHold_; // v48: hold mismatched HELLOs for a DLL push
     // Reliable coordinated-load packets (protocol 32). Guarded by outCs_.
     std::vector<LoadGoPacket>    outLoadGo_;
     std::vector<LoadReqPacket>   outLoadReq_;

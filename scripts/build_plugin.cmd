@@ -32,10 +32,24 @@ set "SDK=C:\Program Files\Microsoft SDKs\Windows\v7.1"
 set "KL=%REPO%\third_party\KenshiLib_deps"
 set "ENET=%REPO%\third_party\enet\enet\include"
 
-REM Locate MSBuild via vswhere (falls back to a common path).
+REM Locate MSBuild via vswhere. The output goes through a temp file, NOT a
+REM for /f backquote: the ")" in the expanded %ProgramFiles(x86)% breaks cmd's
+REM for-parsing ("The system cannot find the path specified"), which silently
+REM left MSBUILD on the fallback path. Fallbacks cover BuildTools and Community
+REM on both C: and F:.
 set "MSBUILD="
-for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" 2^>nul`) do set "MSBUILD=%%i"
-if not defined MSBUILD set "MSBUILD=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE%" (
+    "%VSWHERE%" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" > "%TEMP%\kenshicoop_msbuild.txt" 2>nul
+    set /p MSBUILD=<"%TEMP%\kenshicoop_msbuild.txt"
+    del "%TEMP%\kenshicoop_msbuild.txt" >nul 2>nul
+)
+if not defined MSBUILD if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe" set "MSBUILD=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+if not defined MSBUILD if exist "F:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" set "MSBUILD=F:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
+if not defined MSBUILD (
+    echo ERROR: MSBuild not found - install VS2022 Build Tools or fix VSWHERE.
+    exit /b 1
+)
 
 REM x64 native toolchain on PATH so cl.exe finds its sibling DLLs (mspdb100, etc).
 set "PATH=%VC%\bin\amd64;%VC%\bin;%VS10%\Common7\IDE;%SDK%\Bin\x64;%SDK%\Bin;%PATH%"

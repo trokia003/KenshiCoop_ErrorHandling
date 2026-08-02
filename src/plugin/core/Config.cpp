@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "OwnRanks.h"
+#include "../CoopLog.h" // savePeerToFile outcome lines
 #include <cstdlib>
 #include <cstdio>
 #include <map>
@@ -219,6 +220,15 @@ void loadConfig(Config& c) {
     c.stealthSync = envOr("KENSHICOOP_STEALTH_SYNC", "1") != "0";
     c.moneySync   = envOr("KENSHICOOP_MONEY_SYNC", "1") != "0";
     c.spawnSync   = envOr("KENSHICOOP_SPAWN_SYNC", "1") != "0";
+    // Join world-spawn veto (census-authority sub-gate): while a join session
+    // is live, skip the local ZoneManager spawn-checks ticker so this engine
+    // never generates ambient wildlife/roaming squads the host doesn't have
+    // (transient ghosts the census cull can only hide AFTER they render).
+    c.spawnVeto   = envOr("KENSHICOOP_SPAWN_VETO", "1") != "0";
+    // Town-flavor sub-veto: bar patrons (Town::spawnTheBarFlies) - the host's
+    // rolls cover the join's bars via the proxy pipeline. Separate escape
+    // hatch from spawnVeto (empty-bar risk profile differs from wildlife).
+    c.townVeto    = envOr("KENSHICOOP_TOWN_VETO", "1") != "0";
     c.recruitSync = envOr("KENSHICOOP_RECRUIT_SYNC", "1") != "0";
     c.factionSync = envOr("KENSHICOOP_FACTION_SYNC", "1") != "0";
     c.timeSync    = envOr("KENSHICOOP_TIME_SYNC", "1") != "0";
@@ -227,6 +237,23 @@ void loadConfig(Config& c) {
     c.bdoorSync   = envOr("KENSHICOOP_BDOOR_SYNC", "1") != "0";
     c.hungerSync  = envOr("KENSHICOOP_HUNGER_SYNC", "1") != "0";
     c.saveSync    = envOr("KENSHICOOP_SAVE_SYNC", "1") != "0";
+    // Checkpoint-on-risk (saveSync sub-gate): host saves 'coop_risk' shortly
+    // after a NEW NPC squad cohort enters the census (the 2026-07-22 crash
+    // window), throttled to at most one per riskSaveIntervalSec.
+    c.riskSave    = envOr("KENSHICOOP_RISK_SAVE", "1") != "0";
+    {
+        int s = std::atoi(envOr("KENSHICOOP_RISK_SAVE_INTERVAL_S", "180").c_str());
+        c.riskSaveIntervalSec = (s > 0) ? (unsigned int)s : 180u;
+    }
+    // v48 debug-stage helpers: in-band DLL auto-update + MP log shipping.
+    c.dllPush     = envOr("KENSHICOOP_DLL_PUSH", "1") != "0";
+    c.logShip     = envOr("KENSHICOOP_LOG_SHIP", "1") != "0";
+    {
+        int s = std::atoi(envOr("KENSHICOOP_LOG_SEG_MIN", "15").c_str());
+        c.logSegMin = (s > 0) ? (unsigned int)s : 15u;
+        int f = std::atoi(envOr("KENSHICOOP_LOG_MAX_FILES", "100").c_str());
+        c.logMaxFiles = (f > 0) ? (unsigned int)f : 100u;
+    }
     c.loadSync    = envOr("KENSHICOOP_LOAD_SYNC", "1") != "0";
     c.prodSync    = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
     c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
@@ -259,27 +286,38 @@ void loadConfig(Config& c) {
     }
 
     // Protocol 36 movement-smoothness knobs. Defaults are the historical
-    // constants; any positive env value overrides for live A/B tuning.
+    // constants; any positive env value overrides for live A/B tuning. The
+    // interp knobs also accept coop_config.json values (2026-07-28: a jittery
+    // peer link needs these tuned on a player install where env vars are not
+    // practical - env still wins for the harness).
     {
         c.sendStamp = envOr("KENSHICOOP_SEND_STAMP", "1") != "0";
         int v;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_MIN_DELAY_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_MIN_DELAY_MS",
+                            fileOr(f, "interpMinDelayMs", "0").c_str()).c_str());
         c.interpMinDelayMs = (v > 0) ? (unsigned int)v : 50u;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_DELAY_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_DELAY_MS",
+                            fileOr(f, "interpMaxDelayMs", "0").c_str()).c_str());
         c.interpMaxDelayMs = (v > 0) ? (unsigned int)v : 200u;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_EXTRAP_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_EXTRAP_MS",
+                            fileOr(f, "interpMaxExtrapMs", "0").c_str()).c_str());
         c.interpMaxExtrapMs = (v > 0) ? (unsigned int)v : 250u;
-        v = std::atoi(envOr("KENSHICOOP_INTERP_STALE_MS", "0").c_str());
+        v = std::atoi(envOr("KENSHICOOP_INTERP_STALE_MS",
+                            fileOr(f, "interpStaleMs", "0").c_str()).c_str());
         c.interpStaleMs = (v > 0) ? (unsigned int)v : 2000u;
-        double f;
-        f = std::atof(envOr("KENSHICOOP_INTERP_SNAP_DIST", "0").c_str());
-        c.interpSnapDist = (f > 0.0) ? (float)f : 50.0f;
-        f = std::atof(envOr("KENSHICOOP_CATCHUP_K", "0").c_str());
-        c.catchupK = (f > 0.0) ? (float)f : 2.0f;
-        f = std::atof(envOr("KENSHICOOP_SNAP_DIST", "0").c_str());
-        c.snapDist = (f > 0.0) ? (float)f : 8.0f;
-        f = std::atof(envOr("KENSHICOOP_SNAP_SECONDS", "0").c_str());
-        c.snapSeconds = (f > 0.0) ? (float)f : 0.75f;
+        double fv;
+        fv = std::atof(envOr("KENSHICOOP_INTERP_SNAP_DIST",
+                             fileOr(f, "interpSnapDist", "0").c_str()).c_str());
+        c.interpSnapDist = (fv > 0.0) ? (float)fv : 50.0f;
+        fv = std::atof(envOr("KENSHICOOP_CATCHUP_K",
+                             fileOr(f, "catchupK", "0").c_str()).c_str());
+        c.catchupK = (fv > 0.0) ? (float)fv : 2.0f;
+        fv = std::atof(envOr("KENSHICOOP_SNAP_DIST",
+                             fileOr(f, "snapDist", "0").c_str()).c_str());
+        c.snapDist = (fv > 0.0) ? (float)fv : 8.0f;
+        fv = std::atof(envOr("KENSHICOOP_SNAP_SECONDS",
+                             fileOr(f, "snapSeconds", "0").c_str()).c_str());
+        c.snapSeconds = (fv > 0.0) ? (float)fv : 0.75f;
         // Combat convergence bands (0 = keep the drive's ReplicatorUtil default).
         c.combatSoftDist    = (float)std::atof(envOr("KENSHICOOP_COMBAT_SOFT_DIST", "0").c_str());
         c.combatSnapDist    = (float)std::atof(envOr("KENSHICOOP_COMBAT_SNAP_DIST", "0").c_str());
@@ -361,11 +399,15 @@ std::string describeConfig(const Config& c) {
         { "stats",   c.statsSync },    { "carry",   c.carrySync },
         { "furn",    c.furnSync },     { "chain",   c.chainSync },
         { "stealth", c.stealthSync },  { "money",   c.moneySync },
-        { "spawn",   c.spawnSync },    { "recruit", c.recruitSync },
+        { "spawn",   c.spawnSync },    { "spawnVeto", c.spawnVeto },
+        { "townVeto", c.townVeto },
+        { "recruit", c.recruitSync },
         { "faction", c.factionSync },  { "time",    c.timeSync },
         { "door",    c.doorSync },     { "build",   c.buildSync },
         { "bdoor",   c.bdoorSync },    { "hunger",  c.hungerSync },
-        { "save",    c.saveSync },     { "load",    c.loadSync },
+        { "save",    c.saveSync },     { "riskSave", c.riskSave },
+        { "dllPush", c.dllPush },      { "logShip", c.logShip },
+        { "load",    c.loadSync },
         { "prod",    c.prodSync },     { "research",c.researchSync },
         { "store",   c.storeSync },    { "squad",   c.squadSync },
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
@@ -413,6 +455,71 @@ void reloadPeerFromFile(Config& c) {
     if (it != f.end() && !it->second.empty()) c.ip = it->second;
     it = f.find("port");
     if (it != f.end() && !it->second.empty()) c.port = std::atoi(it->second.c_str());
+}
+
+void savePeerToFile(unsigned long long steamPeer) {
+    if (steamPeer == 0) return;
+    std::string path = configFilePath();
+    char idBuf[32];
+    _snprintf(idBuf, sizeof(idBuf) - 1, "%I64u", steamPeer);
+    idBuf[sizeof(idBuf) - 1] = '\0';
+
+    // Read the current file (may be absent on a bare install).
+    std::string text;
+    {
+        std::ifstream in(path.c_str(), std::ios::binary);
+        if (in) text.assign((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    }
+
+    std::string out;
+    bool replaced = false;
+    if (text.empty()) {
+        out  = "{\n  \"steamPeer\": \"";
+        out += idBuf;
+        out += "\"\n}\n";
+        replaced = true;
+    } else {
+        // Line-level edit: swap the value on the existing "steamPeer" line
+        // (preserving its trailing comma and everything else in the file), or
+        // insert a fresh line right after the opening brace.
+        size_t i = 0;
+        while (i <= text.size()) {
+            size_t nl = text.find('\n', i);
+            std::string line = text.substr(
+                i, nl == std::string::npos ? std::string::npos : nl - i);
+            if (!replaced && line.find("\"steamPeer\"") != std::string::npos) {
+                bool comma = false;
+                for (size_t j = line.size(); j > 0; --j) {
+                    char ch = line[j - 1];
+                    if (ch == ' ' || ch == '\t' || ch == '\r') continue;
+                    comma = (ch == ','); break;
+                }
+                line = std::string("  \"steamPeer\": \"") + idBuf + "\"" +
+                       (comma ? "," : "");
+                replaced = true;
+            }
+            out += line;
+            if (nl == std::string::npos) break;
+            out += '\n';
+            i = nl + 1;
+        }
+        if (!replaced) {
+            size_t brace = out.find('{');
+            std::string ins = std::string("\n  \"steamPeer\": \"") + idBuf + "\",";
+            if (brace != std::string::npos) out.insert(brace + 1, ins);
+            else out = std::string("{") + ins + "\n}\n" + out;
+            replaced = true;
+        }
+    }
+
+    std::ofstream of(path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!of) {
+        coop::logLine("[coop-ui] friend code NOT saved (coop_config.json not writable)");
+        return;
+    }
+    of << out;
+    coop::logLine("[coop-ui] friend code saved to coop_config.json");
 }
 
 } // namespace coop

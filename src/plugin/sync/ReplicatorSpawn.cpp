@@ -123,6 +123,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.dead  = dead ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
             net.queueSpawnInfo(pkt);
+            // v46 wake-heal fix (mint half): the join is about to MINT this
+            // body from its template - full health by construction, whatever
+            // wounds the real one carries. Qualify it for the NPC vitals
+            // stream so the mint's real blood/limb state lands within ~1 s
+            // (a healthy body streams one cheap row and ages back out).
+            if (found && streamNpcs_) medNpc_[k] = nowMs();
             char b[224]; _snprintf(b, sizeof(b) - 1,
                 "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
@@ -516,7 +522,17 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // proxy body's ACTUAL local position, in the SCENARIO series shape (hand
     // order i,s,t,c,cs like MEMBER/RECV lines) so the spawn_sync oracle can
     // time-pair it with the host's MEMBER series per hand.
-    if (!proxyByKey_.empty() && (now - spawnPosLogMs_) >= 500) {
+    // Free-play gate (v46): this series exists for the harness oracles; at
+    // 2 Hz x every proxy it wrote a join-side log 78 MB in one evening and
+    // taxed the main thread with per-line flushes. Scenario runs (or the
+    // KENSHICOOP_PROXY_DUMP=1 escape hatch) keep it; free play stays quiet.
+    static int dumpProxies = -1;
+    if (dumpProxies < 0) {
+        const char* e = getenv("KENSHICOOP_PROXY_DUMP");
+        dumpProxies = (e && e[0] == '1') ? 1 : 0;
+    }
+    if ((proxyTelemetry_ || dumpProxies == 1) &&
+        !proxyByKey_.empty() && (now - spawnPosLogMs_) >= 500) {
         spawnPosLogMs_ = now;
         for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
              it != proxyByKey_.end(); ++it) {

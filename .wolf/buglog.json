@@ -1,0 +1,144 @@
+﻿[
+    {
+        "date":  "2026-07-26",
+        "error_message":  "build_plugin.cmd: \u0027The system cannot find the path specified\u0027 after \u0027where cl.exe\u0027; MSBuild never ran",
+        "root_cause":  "for /f usebackq over vswhere.exe silently fails (the \u0027)\u0027 in the expanded %ProgramFiles(x86)% breaks cmd\u0027s for-parsing), so MSBUILD fell back to a hardcoded C:\\ BuildTools path that doesn\u0027t exist on this machine (VS2022 Community is on F:)",
+        "fix":  "build_plugin.cmd: capture vswhere output via temp file + set /p instead of for /f; added existence-checked fallbacks for BuildTools (C:) and Community (F:) and a loud error when none found",
+        "tags":  [
+                     "build",
+                     "cmd",
+                     "vswhere",
+                     "msbuild"
+                 ]
+    },
+    {
+        "date":  "2026-07-26",
+        "error_message":  "fatal error C1083: Cannot open include file: \u0027boost/unordered_map.hpp\u0027",
+        "root_cause":  "third_party/KenshiLib_deps/boost_1_60_0 contained only boost.zip (git-lfs artifact, never extracted); the deps repo\u0027s Setup.bat does the extraction but was never run",
+        "fix":  "tar -xf boost_1_60_0/boost.zip --directory boost_1_60_0/ (same as Setup.bat)",
+        "tags":  [
+                     "build",
+                     "deps",
+                     "boost"
+                 ]
+    },
+    {
+        "date":  "2026-07-26",
+        "error_message":  "fatal error C1083: Cannot open include file: \u0027kenshi/CombatClass.h\u0027",
+        "root_cause":  "KenshiLib_deps HEAD (b566d74 \u0027Update KenshiLib to 0.4.0\u0027) moved CombatClass.h into kenshi/combat/; KenshiCoop\u0027s code uses the 0.3.0 flat layout",
+        "fix":  "pin deps clone to e75769b (0.3.0 layout + boost env fix): git -C third_party/KenshiLib_deps checkout e75769b; documented in third_party/kenshilib_patches/README.md",
+        "tags":  [
+                     "build",
+                     "deps",
+                     "kenshilib",
+                     "version-pin"
+                 ]
+    },
+    {
+        "date":  "2026-07-26",
+        "error_message":  "error C2011: \u0027BuildingDesignation\u0027 enum type redefinition (Platoon.h vs Building/Building.h); error C2027: use of undefined type \u0027CraftingItem\u0027 in std::deque member (CraftingBuilding.h)",
+        "root_cause":  "KenshiLib 0.3.0/0.4.0 headers ship an identical enum defined in two headers, and a deque member of a forward-declared-only type; VC10 rejects both. Upstream maintainer evidently builds against a locally-fixed deps copy that was never published",
+        "fix":  "local deps patches: shared include guard around both enum copies; opaque placeholder body for CraftingItem (plugin verified to never touch it). Captured as third_party/kenshilib_patches/0001-vc10-header-fixes.patch with README",
+        "tags":  [
+                     "build",
+                     "deps",
+                     "kenshilib",
+                     "vc10"
+                 ]
+    },
+    {
+        "date":  "2026-07-28",
+        "error_message":  "Join stuck at \u0027connected to peer\u0027 - host log: two LOCAL-SAVE edges same tick (autosave2 bootstrap + coop_risk), QUIESCED timeout files=0 on coop_risk, \u0027XFER-BEGIN refused: no folder coop_risk\u0027 - save push never reached the join",
+        "root_cause":  "checkpoint-on-risk consumed a PRE-CONNECT risk edge the instant g_peerPresent flipped true, queueing a second engine save in the same tick as the connect-push bootstrap bake; the engine performs one deferred save, and the single savexfer quiescence watch was re-armed onto the never-written coop_risk folder, so the bootstrap GO/transfer never fired",
+        "fix":  "Plugin.cpp tickCoordinatedSaveLoad: risk save now requires the peer present \u003e= 60 s (RISK_PEER_SETTLE_MS) and !g_bootstrapArmed, in addition to the existing !watching/!savePending gates; stale edge stays pending and fires later if still relevant",
+        "tags":  [
+                     "riskSave",
+                     "bootstrap",
+                     "save-sync",
+                     "race"
+                 ]
+    },
+    {
+        "date":  "2026-07-28",
+        "error_message":  "Risk checkpoints fired once per connection then never again (host log: 20 NEW-SQUAD cohorts pending, zero RISK-CHECKPOINT lines)",
+        "root_cause":  "gate used g_savePending.empty() as \u0027no save in flight\u0027, but g_savePending is only cleared by the bootstrap-GO and mid-session-load paths - a normal QUIESCED-\u003ebeginSend transfer leaves it set forever, so the gate stayed false after the first risk save",
+        "fix":  "gate on !savexfer::watching() \u0026\u0026 !savexfer::sending() instead of g_savePending",
+        "tags":  [
+                     "riskSave",
+                     "save-sync",
+                     "gating"
+                 ]
+    },
+    {
+        "date":  "2026-07-28",
+        "error_message":  "Buildings placed by the host never appeared for the join (zero [build] PLACE lines all session; latejoin RESYNC place=0)",
+        "root_cause":  "placeFinalPreviewBuilding is a VIRTUAL; the detour hooks only the base impl (wall/gate previews override it), and the hook\u0027s hand-resolve failure path returned silently. No capture -\u003e nothing streamed",
+        "fix":  "Three-part: (1) hook logs every invocation incl. refused/unresolved; (2) placement-capture fallback census in publishBuilds - incomplete-site census diffs vs a session baseline, new non-proxy non-announced sites queue fromUi=2 edges; (3) applyBuilds dup guard - announced keys that resolve locally (shared baked sites) map instead of minting a duplicate",
+        "tags":  [
+                     "buildSync",
+                     "detour",
+                     "virtual",
+                     "census"
+                 ]
+    },
+    {
+        "date":  "2026-07-28",
+        "error_message":  "[money] SEND cats=0 on BOTH clients all session while players held real money; no money ever crossed",
+        "root_cause":  "protocol-22 read the Ownerships::money block via the platoon walk; on real saves that storage reads 0 - Character::getMoney (the engine\u0027s own display/spend read) is the canonical getter",
+        "fix":  "readWalletByHand prefers Character::getMoney (one-shot probe logs both sources); writeWalletByHand = verify ladder: Ownerships::setMoney -\u003e read back via getMoney -\u003e apply remaining delta via Character::takeMoney -\u003e loud log if still mismatched",
+        "tags":  [
+                     "moneySync",
+                     "wallet",
+                     "engine"
+                 ]
+    },
+    {
+        "date":  "2026-07-28",
+        "error_message":  "Ground-gear ghost/dup (original 2026-07-21 report): picking up save-native or NPC-shed gear left the peer\u0027s copy on the ground (PICKUP-APPLY ref=0/0 moved=0), pickable again = item duplication",
+        "root_cause":  "pre-existing ground gear is tracked by NEITHER item channel (W1 world channel excludes gear via isGearType; W2 weapon census only tracks session drops from tracked inventories), so peer pickups carry no identity and the apply side had nothing to remove",
+        "fix":  "apply-side spatial fallback: when ref=0/0 AND zero tracked same-sid copies exist (identity system has nothing to protect), engine::findGroundItemBySidNear finds the nearest FREE same-sid ground item within 80u of the picker and re-homes it via addItemPtrToInventory. Logged as ghostFb=1 in PICKUP-APPLY. Tracked duplicates keep the strict never-guess rule",
+        "tags":  [
+                     "worldSync",
+                     "ground-gear",
+                     "item-dup",
+                     "ghost"
+                 ]
+    },
+    {
+        "date":  "2026-07-31",
+        "error_message":  "prototest FAIL 433/435: sizeof(SaveBeginPacket) 68 != expected 67, PROTOCOL_VERSION 47 != expected 45 - contract expectations were never bumped with the v46/v47 wire changes",
+        "root_cause":  "v46 added SaveBeginPacket.delta (+1 byte) and v46/v47 bumped PROTOCOL_VERSION, but src/prototest/main.cpp kept the v45 expected values; earlier green runs predate the rebuild of prototest against the new Wire.h",
+        "fix":  "updated the two expectations (68 with a v46 +delta note; version check now names v47) - 435/435 PASS. Rule: every Wire.h layout/version change must touch the prototest CHECK_EQ table in the same batch",
+        "tags":  [
+                     "prototest",
+                     "contract-tests",
+                     "wire",
+                     "protocol"
+                 ]
+    },
+    {
+        "date":  "2026-08-01",
+        "error_message":  "Join chest deposits invisible to host; host log [xfer] APPLY moved=0 fab=0 (qty=2) with sporadic qty=1 successes; host authored bogus chest-\u003echest intents + [xfer] defer-expired churn",
+        "root_cause":  "THREE stacked defects: (1) coopUiConnect never re-derives role-latched wiring - a default-HOST config that picks JOIN in the F2 panel keeps storeSync_ ON and census-authors world chests (dual-writer: deposits become own-\u003eown on the join, no intent authored, and neither side reconciles the other); also reportCombat/gateAuthority stayed host-mode. (2) detectAndPublishTransfers/applyTransfers ownership tests omit censusContainers_, so the HOST treats its own census-authored chests as peer - bogus intents + latches against its own snapshots. (3) createItemAndAdd mints a 1-unit Item then tryAddItem(it, qty) - every qty\u003e1 fabrication fails (qty=1 worked)",
+        "fix":  "coopUiConnect re-derives setStoreSync/setReportCombat/setGateAuthority from the panel role; censusContainers_ added to both srcOwn/dstOwn tests; it-\u003equantity = qty stamped before tryAddItem",
+        "tags":  [
+                     "xferSync",
+                     "storeSync",
+                     "container",
+                     "role-flip",
+                     "dup"
+                 ]
+    },
+    {
+        "date":  "2026-08-01",
+        "error_message":  "Join placing materials into construction sites invisible on host (animation + progress + completion synced, materials not)",
+        "root_cause":  "construction-site material inventories had NO channel: enumContainersNear skipped every incomplete site (isComplete filter), so the protocol-34 container census never authored them",
+        "fix":  "enumContainersNear authors INCOMPLETE sites regardless of container class (their inventory is the materials); inventory-less sites drop at the hasInv filter. Site deposits now ride the normal census-snapshot + xfer-intent flow",
+        "tags":  [
+                     "storeSync",
+                     "construction",
+                     "site-materials",
+                     "container"
+                 ]
+    }
+]

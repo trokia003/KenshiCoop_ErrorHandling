@@ -551,7 +551,30 @@ void snapshotVoteButtons() {
     memcpy(g_voteBtn, buf, n); g_voteBtnN = n;
 }
 
+// Panel-toggle key guard: Kenshi's own keymap ALSO reacts to the F2 panel
+// toggle (field report: opening the co-op panel unpaused a paused game). For a
+// short window armed on the toggle keypress, USER-originated pause/speed
+// writes are swallowed whole - the engine never sees the change, so there is
+// nothing to undo and the speed-sync layer records no intent. Quiet writes
+// from the sync layer itself (g_speedGuardWrite) always pass.
+unsigned long g_uiKeyGuardUntil = 0;
+static unsigned long g_uiKeyGuardLoggedAt = 0;
+static bool uiKeyGuardSwallow(const char* what) {
+    if (g_uiKeyGuardUntil == 0 || GetTickCount() >= g_uiKeyGuardUntil)
+        return false;
+    if (g_uiKeyGuardLoggedAt != g_uiKeyGuardUntil) { // once per guard window
+        g_uiKeyGuardLoggedAt = g_uiKeyGuardUntil;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1,
+                  "[coop-ui] %s swallowed (panel-toggle key guard)", what);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+    return true;
+}
+
 void __fastcall setGameSpeed_hook(GameWorld* self, float speed, bool click) {
+    if (!g_speedGuardWrite && uiKeyGuardSwallow("setGameSpeed")) return;
     if (speedDbgOn()) speedDbgLog("setGameSpeed", speed, click ? 1 : 0);
     if (!g_speedGuardWrite && speed > 0.0f) {
         g_speedIntentMult  = speed;
@@ -564,6 +587,7 @@ void __fastcall setGameSpeed_hook(GameWorld* self, float speed, bool click) {
 }
 
 void __fastcall userPause_hook(GameWorld* self, bool p) {
+    if (!g_speedGuardWrite && uiKeyGuardSwallow("userPause")) return;
     if (speedDbgOn()) speedDbgLog("userPause", 0.0f, p ? 1 : 0);
     if (!g_speedGuardWrite) {
         g_speedIntentPaused = p;
@@ -574,6 +598,7 @@ void __fastcall userPause_hook(GameWorld* self, bool p) {
 }
 
 void __fastcall togglePause_hook(GameWorld* self, bool p) {
+    if (!g_speedGuardWrite && uiKeyGuardSwallow("togglePause")) return;
     if (speedDbgOn()) speedDbgLog("togglePause", 0.0f, p ? 1 : 0);
     if (!g_speedGuardWrite) {
         g_speedIntentPaused = p;
@@ -972,11 +997,20 @@ void __fastcall placeFinal_hook(PreviewBuilding* self) {
     __try {
         if (!self) return;
         Building* b = self->justBeenBuilt;
-        if (!b) return; // commit refused (placement rules) - nothing placed
+        if (!b) { // commit refused (placement rules) - nothing placed
+            coop::logLine("[build] PLACE-HOOK fired: commit refused (no justBeenBuilt)");
+            return;
+        }
         BuildEdgeRec e;
         memset(&e, 0, sizeof(e));
         RootObject* ro = static_cast<RootObject*>(b);
-        if (!readObjectHand(ro, e.hand)) return;
+        if (!readObjectHand(ro, e.hand)) {
+            // LOUD (2026-07-28): this used to return silently, making a missed
+            // capture indistinguishable from the detour never firing. The
+            // build-census fallback (publishBuilds 1a) announces the site.
+            coop::logLine("[build] PLACE-HOOK fired: hand unresolved (census fallback will announce)");
+            return;
+        }
         GameData* gd = ro->getGameData();
         if (gd) {
             strncpy(e.sid, gd->stringID.c_str(), sizeof(e.sid) - 1);

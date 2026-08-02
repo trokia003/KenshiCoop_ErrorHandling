@@ -84,7 +84,8 @@ NetLink::NetLink()
       thread_(0), running_(0), stopFlag_(0), myId_(0),
       sendEpoch_(0),
       steamPeer_(0),
-      simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
+      simDelayMs_(0), simJitterMs_(0), simLossPct_(0),
+      dllPushHold_(0) {
     InitializeCriticalSection(&outCs_);
 }
 
@@ -227,6 +228,10 @@ void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, ou
 
 void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) { pushLocked(outCs_, outWorldPickups_, pkt); }
 
+void NetLink::queueWorldTake(const WorldTakePacket& pkt) { pushLocked(outCs_, outWorldTakes_, pkt); }
+
+void NetLink::queueProdDelta(const ProdDeltaPacket& pkt) { pushLocked(outCs_, outProdDeltas_, pkt); }
+
 void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInvXfers_, pkt); }
 
 void NetLink::queueSaveReq(const SaveReqPacket& pkt) { pushLocked(outCs_, outSaveReq_, pkt); }
@@ -252,6 +257,29 @@ void NetLink::queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs,
 }
 
 void NetLink::queueSaveAck(const SaveAckPacket& pkt) { pushLocked(outCs_, outSaveAck_, pkt); }
+
+void NetLink::queueFileBegin(const FilePushBeginPacket& hdr, const char* name) {
+    OutFileBegin fb;
+    fb.hdr = hdr;
+    fb.tail.assign(name, name + hdr.nameLen);
+    pushLocked(outCs_, outFileBegin_, fb);
+}
+
+void NetLink::queueFileChunk(const FilePushChunkPacket& hdr,
+                             const unsigned char* data, unsigned int dataLen) {
+    OutFileChunk fc;
+    fc.hdr = hdr;
+    if (data && dataLen > 0) fc.tail.assign(data, data + dataLen);
+    pushLocked(outCs_, outFileChunk_, fc);
+}
+
+void NetLink::queueFileDone(const FilePushDonePacket& pkt) { pushLocked(outCs_, outFileDone_, pkt); }
+
+void NetLink::queueFileAck(const FilePushAckPacket& pkt) { pushLocked(outCs_, outFileAck_, pkt); }
+
+void NetLink::queueBuildInfo(const BuildInfoPacket& pkt) { pushLocked(outCs_, outBuildInfo_, pkt); }
+
+void NetLink::setDllPushHold(bool on) { InterlockedExchange(&dllPushHold_, on ? 1 : 0); }
 
 void NetLink::queueLoadGo(const LoadGoPacket& pkt) { pushLocked(outCs_, outLoadGo_, pkt); }
 
@@ -448,13 +476,32 @@ void NetLink::threadLoop() {
                         HelloPacket h;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &h)) {
                             if (h.version != PROTOCOL_VERSION) {
-                                char b[128];
-                                _snprintf(b, sizeof(b) - 1,
-                                          "protocol mismatch: peer v%u, ours v%u; rejecting",
-                                          (unsigned)h.version, (unsigned)PROTOCOL_VERSION);
-                                b[sizeof(b) - 1] = '\0';
-                                netErr(b);
-                                enet_peer_disconnect(ev.peer, 0);
+                                if (dllPushHold_) {
+                                    // v48 DLL push: HOLD the mismatched peer -
+                                    // an id so sends reach it, no WELCOME so no
+                                    // session forms - and tell the main thread
+                                    // to push our DLL over the frozen FILE_*
+                                    // subset. The peer restarts on its own
+                                    // after the swap.
+                                    u32 id = nextId++;
+                                    ev.peer->data = (void*)(size_t)id;
+                                    char b[160];
+                                    _snprintf(b, sizeof(b) - 1,
+                                              "protocol mismatch: peer v%u, ours v%u; "
+                                              "HOLDING connection for DLL update",
+                                              (unsigned)h.version, (unsigned)PROTOCOL_VERSION);
+                                    b[sizeof(b) - 1] = '\0';
+                                    netLog(b);
+                                    if (inbound_) inbound_->pushVerMismatch(id, h.version);
+                                } else {
+                                    char b[128];
+                                    _snprintf(b, sizeof(b) - 1,
+                                              "protocol mismatch: peer v%u, ours v%u; rejecting",
+                                              (unsigned)h.version, (unsigned)PROTOCOL_VERSION);
+                                    b[sizeof(b) - 1] = '\0';
+                                    netErr(b);
+                                    enet_peer_disconnect(ev.peer, 0);
+                                }
                             } else {
                                 u32 id = nextId++;
                                 // TWO-PLAYER ASSUMPTION (step-6 guard): the sync model
@@ -620,6 +667,20 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wpp)
                             && inbound_) {
                             inbound_->pushWorldPickup(wpp.ownerId, wpp);
+                        }
+                    } else if (type == PKT_WORLD_TAKE) {
+                        // Reliable baseline ground-item removal notice (v46).
+                        WorldTakePacket wtp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wtp)
+                            && inbound_) {
+                            inbound_->pushWorldTake(wtp.ownerId, wtp);
+                        }
+                    } else if (type == PKT_PROD_DELTA) {
+                        // Reliable join->host production intent (v47).
+                        ProdDeltaPacket pdp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pdp)
+                            && inbound_) {
+                            inbound_->pushProdDelta(pdp.ownerId, pdp);
                         }
                     } else if (type == PKT_INV_XFER) {
                         // Reliable cross-owner transfer intent (protocol 37).
@@ -803,6 +864,52 @@ void NetLink::threadLoop() {
                                                        (const u8*)p + hdr.pathLen);
                             }
                         }
+                    } else if (type == PKT_FILE_BEGIN) {
+                        // v48 file push announce: [FilePushBeginPacket][name].
+                        // Frozen wire subset - parsed regardless of session
+                        // state (a DLL push runs on a held mismatched peer).
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(FilePushBeginPacket) && inbound_) {
+                            FilePushBeginPacket hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(FilePushBeginPacket) + (unsigned)hdr.nameLen;
+                            if (len >= need && hdr.nameLen > 0 &&
+                                hdr.nameLen <= FILE_PUSH_NAME_MAX) {
+                                inbound_->pushFileBegin(hdr.ownerId, hdr,
+                                    (const char*)(ev.packet->data + sizeof(FilePushBeginPacket)));
+                            }
+                        }
+                    } else if (type == PKT_FILE_CHUNK) {
+                        // v48 file push chunk: [FilePushChunkPacket][payload].
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(FilePushChunkPacket) && inbound_) {
+                            FilePushChunkPacket hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(FilePushChunkPacket) + (unsigned)hdr.dataLen;
+                            if (len >= need && hdr.dataLen > 0 &&
+                                hdr.dataLen <= FILE_PUSH_CHUNK_MAX) {
+                                inbound_->pushFileChunk(hdr.ownerId, hdr,
+                                    (const u8*)(ev.packet->data + sizeof(FilePushChunkPacket)));
+                            }
+                        }
+                    } else if (type == PKT_FILE_DONE) {
+                        FilePushDonePacket fd;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fd)
+                            && inbound_) {
+                            inbound_->pushFileDone(fd.ownerId, fd);
+                        }
+                    } else if (type == PKT_FILE_ACK) {
+                        FilePushAckPacket fa;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fa)
+                            && inbound_) {
+                            inbound_->pushFileAck(fa.ownerId, fa);
+                        }
+                    } else if (type == PKT_BUILD_INFO) {
+                        BuildInfoPacket bi;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bi)
+                            && inbound_) {
+                            inbound_->pushBuildInfo(bi.ownerId, bi);
+                        }
                     } else if (type == PKT_SAVE_DONE) {
                         // Reliable save-transfer CRC table (protocol 31, host -> join):
                         // [SaveDoneHeader][u32 crc * fileCount].
@@ -900,6 +1007,19 @@ void NetLink::threadLoop() {
                         _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
                         b[sizeof(b) - 1] = '\0';
                         netLog(b);
+                        // v46 id hygiene: with NO peers left, the next connect
+                        // is a fresh (or reconnecting) session, not a third
+                        // player - reuse id 1 instead of counting up forever
+                        // (the old counter made every reconnect log the "3+
+                        // players unsupported" error and leak dead-id state).
+                        bool anyLeft = false;
+                        for (size_t pi = 0; pi < enetHost_->peerCount && !anyLeft; ++pi)
+                            if (enetHost_->peers[pi].state == ENET_PEER_STATE_CONNECTED)
+                                anyLeft = true;
+                        if (!anyLeft) {
+                            nextId = 1;
+                            netLog("player id counter reset (no peers connected)");
+                        }
                     } else {
                         serverPeer_ = 0;
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
@@ -1092,6 +1212,40 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < drops.size(); ++i) {
             ENetPacket* out = enet_packet_create(&drops[i], sizeof(WorldDropPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued production intents on CH_RELIABLE (v47).
+        std::vector<ProdDeltaPacket> prodDeltas;
+        EnterCriticalSection(&outCs_);
+        prodDeltas.swap(outProdDeltas_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < prodDeltas.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&prodDeltas[i], sizeof(ProdDeltaPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued baseline TAKE notices on CH_RELIABLE (v46).
+        std::vector<WorldTakePacket> takes;
+        EnterCriticalSection(&outCs_);
+        takes.swap(outWorldTakes_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < takes.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&takes[i], sizeof(WorldTakePacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
@@ -1607,6 +1761,86 @@ void NetLink::threadLoop() {
                 enet_host_broadcast(enetHost_, CH_BULK, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_BULK, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send v48 file-push packets on CH_BULK (bulk freight, same as
+        // the save transfer) and BUILD_INFO on CH_RELIABLE (one tiny packet).
+        // Broadcast is correct on the host: single-peer model, and the held
+        // mismatched peer (DLL update) is a normal ENet peer.
+        std::vector<OutFileBegin>       fileBegins;
+        std::vector<OutFileChunk>       fileChunks;
+        std::vector<FilePushDonePacket> fileDones;
+        std::vector<FilePushAckPacket>  fileAcks;
+        std::vector<BuildInfoPacket>    buildInfos;
+        EnterCriticalSection(&outCs_);
+        fileBegins.swap(outFileBegin_);
+        fileChunks.swap(outFileChunk_);
+        fileDones.swap(outFileDone_);
+        fileAcks.swap(outFileAck_);
+        buildInfos.swap(outBuildInfo_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < fileBegins.size(); ++i) {
+            unsigned bytes = sizeof(FilePushBeginPacket) + (unsigned)fileBegins[i].tail.size();
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            std::memcpy(out->data, &fileBegins[i].hdr, sizeof(FilePushBeginPacket));
+            if (!fileBegins[i].tail.empty())
+                std::memcpy(out->data + sizeof(FilePushBeginPacket), &fileBegins[i].tail[0],
+                            fileBegins[i].tail.size());
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_BULK, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_BULK, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        for (size_t i = 0; i < fileChunks.size(); ++i) {
+            unsigned bytes = sizeof(FilePushChunkPacket) + (unsigned)fileChunks[i].tail.size();
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            std::memcpy(out->data, &fileChunks[i].hdr, sizeof(FilePushChunkPacket));
+            if (!fileChunks[i].tail.empty())
+                std::memcpy(out->data + sizeof(FilePushChunkPacket), &fileChunks[i].tail[0],
+                            fileChunks[i].tail.size());
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_BULK, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_BULK, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        for (size_t i = 0; i < fileDones.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&fileDones[i], sizeof(FilePushDonePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_BULK, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_BULK, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        for (size_t i = 0; i < fileAcks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&fileAcks[i], sizeof(FilePushAckPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_BULK, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_BULK, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        for (size_t i = 0; i < buildInfos.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&buildInfos[i], sizeof(BuildInfoPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
             }

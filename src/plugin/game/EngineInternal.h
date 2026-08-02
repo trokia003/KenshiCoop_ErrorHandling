@@ -380,6 +380,11 @@ extern SetGameSpeedFn g_setGameSpeedOrig;
 extern UserPauseFn    g_userPauseOrig;
 extern UserPauseFn    g_togglePauseOrig;
 extern bool  g_speedGuardWrite;
+// Panel-toggle key guard: while GetTickCount() < this, USER-originated
+// pause/speed writes are swallowed (Kenshi's keymap reacts to the F2 panel
+// toggle too - it unpaused a paused game). Armed by coopPanelTick on the F2
+// rising edge; quiet sync writes (g_speedGuardWrite) always pass.
+extern unsigned long g_uiKeyGuardUntil;
 extern bool  g_speedIntentFresh;
 extern float g_speedIntentMult;
 extern bool  g_speedIntentPaused;

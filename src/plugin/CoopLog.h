@@ -39,6 +39,39 @@ void logSetFakeSkewMs(long skewMs);
 void logLine(const char* msg);
 void logErrLine(const char* msg);
 
+// Re-tag the log at a role flip (the F2 panel picks host/join AFTER logInit
+// baked the config default - a panel-JOIN client stamped and NAMED everything
+// HOST). Later lines carry the new tag; segment files opened from now on are
+// named with it too. Thread-safe.
+void logSetTag(const char* modeTag);
+
+// CrashGuard black box: copy the last ~64 log lines (oldest first, newline-
+// separated, NUL-terminated) into 'out'. Returns bytes written. Lock-FREE by
+// design - safe to call from a crash handler; a torn line is acceptable.
+unsigned int logRecentTo(char* out, unsigned int cap);
+
+// Crash-context FATAL line: like logErrLine but TryEnterCriticalSection - a
+// crashing thread that already holds the log lock skips instead of deadlocking.
+void logCrashLine(const char* msg);
+
+// ---- MP log segmentation (v48 log shipping) ---------------------------------
+// Mirror every line into <dir>\KenshiCoop_<tag>_<yyyymmdd_hhmmss>.log, rolling
+// to a fresh segment every segMinutes and pruning the directory to maxFiles
+// (oldest first; shipped *.sent copies count toward the cap). The MAIN log file
+// is untouched - the harness oracles parse it. Call once after logInit; the
+// segment writer shares the log lock, so it is exactly as thread-safe as
+// logLine. A crash leaves the current segment on disk (per-line flush) where
+// the next session's unshipped scan finds it.
+void logSegmentsInit(const char* dir, unsigned int segMinutes, unsigned int maxFiles);
+
+// MAIN thread: drain full paths of segments CLOSED by rotation since the last
+// call (each is finished and shippable). Returns the count written to out.
+unsigned int logTakeFinishedSegments(char out[][512], unsigned int maxOut);
+
+// The ACTIVE segment's full path ("" when segmentation is off) - shippers must
+// skip it (still being written).
+void logCurrentSegment(char* out, unsigned int cap);
+
 // Flush and close the file. Called right before ExitProcess on test self-exit.
 void logClose();
 

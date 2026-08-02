@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <map>
 
 namespace coop {
 namespace savexfer {
@@ -154,6 +155,7 @@ bool relPathSafe(const char* p, unsigned int len) {
 
 bool                  g_sendActive = false;
 u32                   g_sendXferId = 0;      // monotonic per-host
+u32                   g_skipSeq    = 0;      // XFER-SKIP count (resync treats a skip as done)
 std::string           g_sendName;
 std::string           g_sendFolder;
 std::vector<XferFile> g_sendFiles;
@@ -189,6 +191,8 @@ void sendAbort(const char* why) {
 // ---- Receiver state (join, main thread only) -----------------------------------
 
 bool             g_recvActive = false;
+bool             g_recvDelta  = false; // v46: merge commit instead of folder swap
+std::vector<std::string> g_recvDelPaths; // v47: tombstoned rel paths (delta)
 u32              g_recvXferId = 0;
 std::string      g_recvName;
 std::string      g_recvStaging;
@@ -393,6 +397,53 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 // ---- Sender (host) -------------------------------------------------------------
 #ifndef KENSHICOOP_PROTOTEST
 
+// ---- v46 DELTA transfers ----------------------------------------------------
+// The whole save folder used to stream on EVERY coordinated save; the folder
+// grows with every zone visited (3.5 -> 6.9 MB inside 12 minutes live), and a
+// mid-play full push measurably starved the entity stream (the 2026-07-28
+// teleport/ghost windows lined up with transfers). The sender remembers the
+// per-file CRCs of the last transfer this PEER ACKed per save name and sends
+// only changed/new files; the receiver merges them onto its committed copy.
+// A file DELETED sender-side since that manifest forces a full send (the
+// merge could never remove it - a stale platoon file would resurrect a dead
+// squad). ACK fail or peer disconnect clears the manifest (next send full).
+typedef std::map<std::string, u32> FileCrcMap;               // rel -> content CRC
+static std::map<std::string, FileCrcMap> g_ackedManifest;    // save name -> last ACKed
+static FileCrcMap  g_pendManifest;      // full manifest of the in-flight send
+static std::string g_pendManifestName;
+static u32         g_pendManifestXferId = 0;
+// v47 deletion tombstones: Kenshi's save rewrite DELETES files (dead squads'
+// platoons, left zones) almost every save, which forced every delta back to a
+// full send (11.5 MB per risk save in the 2026-07-30 session). Deleted rel
+// paths now ride the delta as zero-byte SAVE_FILE chunks with the sentinel
+// offset 0xFFFFFFFF / fileIdx 0xFFFF; the receiver removes them at commit.
+static std::vector<std::string> g_sendDelPaths;
+static size_t                   g_sendDelIdx = 0;
+const u32 SAVE_DEL_OFFSET  = 0xFFFFFFFFu;
+const u16 SAVE_DEL_FILEIDX = 0xFFFFu;
+
+static u32 fileCrc(const std::string& full, bool* okOut) {
+    if (okOut) *okOut = false;
+    HANDLE h = CreateFileA(full.c_str(), GENERIC_READ, FILE_SHARE_READ, 0,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    static unsigned char buf[65536];
+    u32 crc = fnv1aInit();
+    DWORD got = 0;
+    while (ReadFile(h, buf, sizeof(buf), &got, 0) && got > 0)
+        crc = fnv1aUpdate(crc, buf, (unsigned int)got);
+    CloseHandle(h);
+    if (okOut) *okOut = true;
+    return crc;
+}
+
+void resetPeerState() {
+    g_ackedManifest.clear();
+    g_pendManifest.clear();
+    g_pendManifestName.clear();
+    g_pendManifestXferId = 0;
+}
+
 bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     sendCloseFile();
     g_sendFiles.clear();
@@ -414,11 +465,69 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
         g_sendFiles.clear();
         return false;
     }
+
+    // v46 delta decision: CRC the current folder, diff against the last
+    // manifest this peer ACKed for this save name.
+    FileCrcMap current;
+    for (size_t i = 0; i < g_sendFiles.size(); ++i) {
+        bool ok = false;
+        u32 crc = fileCrc(pathJoin(folder, g_sendFiles[i].rel), &ok);
+        if (!ok) { current.clear(); break; } // unreadable -> full send, no manifest
+        current[g_sendFiles[i].rel] = crc;
+    }
+    bool delta = false;
+    g_sendDelPaths.clear();
+    g_sendDelIdx = 0;
+    if (!current.empty()) {
+        std::map<std::string, FileCrcMap>::iterator prior = g_ackedManifest.find(name);
+        if (prior != g_ackedManifest.end()) {
+            // Deleted-since-last-ACK files ride the delta as tombstones (v47);
+            // only an absurd churn (or over-long paths) falls back to full.
+            std::vector<std::string> dels;
+            bool delOk = true;
+            for (FileCrcMap::iterator pi = prior->second.begin();
+                 pi != prior->second.end(); ++pi) {
+                if (current.find(pi->first) != current.end()) continue;
+                if (pi->first.size() > SAVE_PATH_MAX) { delOk = false; break; }
+                dels.push_back(pi->first);
+                if (dels.size() > 256) { delOk = false; break; }
+            }
+            if (delOk) {
+                std::vector<XferFile> changed;
+                for (size_t i = 0; i < g_sendFiles.size(); ++i) {
+                    FileCrcMap::iterator pf = prior->second.find(g_sendFiles[i].rel);
+                    if (pf == prior->second.end() ||
+                        pf->second != current[g_sendFiles[i].rel])
+                        changed.push_back(g_sendFiles[i]);
+                }
+                if (changed.empty() && dels.empty()) {
+                    // Byte-identical to what the peer already committed.
+                    char b[160];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[save] XFER-SKIP name='%s' unchanged since last "
+                              "ACKed transfer (%u files)",
+                              name.c_str(), (unsigned)g_sendFiles.size());
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    g_sendFiles.clear();
+                    ++g_skipSeq;
+                    return true;
+                }
+                g_sendFiles.swap(changed);
+                g_sendDelPaths.swap(dels);
+                delta = true;
+            }
+        }
+    }
+    // Remember the FULL manifest for this send; promoted on the peer's ACK.
+    g_pendManifest       = current;
+    g_pendManifestName   = current.empty() ? std::string() : name;
+
     g_sendTotalBytes = 0;
     for (size_t i = 0; i < g_sendFiles.size(); ++i)
         g_sendTotalBytes += g_sendFiles[i].size;
 
     ++g_sendXferId;
+    g_pendManifestXferId = g_pendManifestName.empty() ? 0 : g_sendXferId;
     g_sendName      = name;
     g_sendFolder    = folder;
     g_sendFileIdx   = 0;
@@ -438,13 +547,14 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     strncpy(bp.name, name.c_str(), sizeof(bp.name) - 1);
     bp.fileCount  = (u16)g_sendFiles.size();
     bp.totalBytes = g_sendTotalBytes;
+    bp.delta      = delta ? 1 : 0;
     net.queueSaveBegin(bp);
 
     char b[192];
     _snprintf(b, sizeof(b) - 1,
-              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u",
+              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u mode=%s",
               g_sendXferId, name.c_str(), (unsigned)g_sendFiles.size(),
-              g_sendTotalBytes);
+              g_sendTotalBytes, delta ? "delta" : "full");
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     return true;
 }
@@ -456,6 +566,22 @@ bool tickSend(NetLink& net, u32 localId) {
     unsigned long now = GetTickCount();
     if (g_sendLastBurst != 0 && now - g_sendLastBurst < SEND_BURST_MS) return false;
     g_sendLastBurst = now;
+
+    // v47 deletion tombstones first (tiny; the receiver records them and
+    // removes the files at delta-commit).
+    while (g_sendDelIdx < g_sendDelPaths.size()) {
+        const std::string& rel = g_sendDelPaths[g_sendDelIdx++];
+        SaveFileHeader fh;
+        fh.type    = (u8)PKT_SAVE_FILE;
+        fh.ownerId = localId;
+        fh.xferId  = g_sendXferId;
+        fh.fileIdx = SAVE_DEL_FILEIDX;
+        fh.pathLen = (u16)rel.size();
+        fh.offset  = SAVE_DEL_OFFSET;
+        fh.dataLen = 0;
+        net.queueSaveFile(fh, rel.c_str(),
+                          reinterpret_cast<const unsigned char*>(""), 0);
+    }
 
     unsigned char buf[SAVE_CHUNK_MAX];
     for (unsigned int c = 0; c < SEND_CHUNKS_PER_BURST; ++c) {
@@ -540,7 +666,23 @@ u16              recvFileCount()  { return g_recvFileCount; }
 
 static u32 g_lastAckXferId = 0;
 static int g_lastAckOk     = -1;
-void noteAck(u32 xferId, int ok) { g_lastAckXferId = xferId; g_lastAckOk = ok; }
+#ifndef KENSHICOOP_PROTOTEST
+u32 skipSeq() { return g_skipSeq; } // sender state - not built for prototest
+#endif
+void noteAck(u32 xferId, int ok) {
+    g_lastAckXferId = xferId; g_lastAckOk = ok;
+#ifndef KENSHICOOP_PROTOTEST
+    // v46 delta transfers: a successful commit promotes the pending manifest
+    // (the peer now holds exactly these files); a FAILED commit clears the
+    // save's manifest so the next transfer is a trustworthy full send.
+    if (!g_pendManifestName.empty() && xferId == g_pendManifestXferId) {
+        if (ok) g_ackedManifest[g_pendManifestName] = g_pendManifest;
+        else    g_ackedManifest.erase(g_pendManifestName);
+        g_pendManifestName.clear();
+        g_pendManifestXferId = 0;
+    }
+#endif
+}
 u32  lastAckXferId() { return g_lastAckXferId; }
 int  lastAckOk()     { return g_lastAckOk; }
 
@@ -566,6 +708,8 @@ void onSaveBegin(const SaveBeginPacket& b) {
     g_recvXferId     = b.xferId;
     g_recvFileCount  = b.fileCount;
     g_recvTotalBytes = b.totalBytes;
+    g_recvDelta      = (b.delta != 0);
+    g_recvDelPaths.clear();
     g_recvBytes      = 0;
     g_recvStartTick  = GetTickCount();
     g_recvStaging    = saveFolderFor(g_recvName + "__incoming");
@@ -589,11 +733,17 @@ void onSaveBegin(const SaveBeginPacket& b) {
 
 void onSaveFile(const SaveFileHeader& h, const char* path, const unsigned char* data) {
     if (!g_recvActive || h.xferId != g_recvXferId) return; // stale/aborted transfer
-    if (h.fileIdx >= g_recvFileCount) return;
     if (!relPathSafe(path, h.pathLen)) {
         coop::logErrLine("[save] XFER chunk rejected: unsafe relative path");
         return;
     }
+    // v47 deletion tombstone (delta transfers): record; removed at commit.
+    if (h.fileIdx == 0xFFFFu && h.offset == 0xFFFFFFFFu && h.dataLen == 0) {
+        if (g_recvDelta && g_recvDelPaths.size() < 512)
+            g_recvDelPaths.push_back(std::string(path, path + h.pathLen));
+        return;
+    }
+    if (h.fileIdx >= g_recvFileCount) return;
 
     if (g_recvOpenIdx != (int)h.fileIdx) {
         recvCloseFile();
@@ -643,7 +793,43 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
         }
     }
 
-    if (ok) {
+    if (ok && g_recvDelta) {
+        // v46 DELTA commit: overlay the staged (changed) files onto the
+        // already-committed copy. No base folder = nothing to merge onto -
+        // fail, so the ACK tells the sender to clear its manifest and the
+        // next transfer arrives full. A partial merge failure is also a
+        // fail-ACK; the sender's next full send (plus the LOAD_GO
+        // fingerprint check) heals any inconsistency.
+        std::string finalDir = saveFolderFor(g_recvName);
+        if (GetFileAttributesA(finalDir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            ok = false;
+        } else {
+            std::vector<XferFile> staged;
+            collectFiles(g_recvStaging, "", 0, &staged);
+            for (size_t i = 0; i < staged.size() && ok; ++i) {
+                std::string src = pathJoin(g_recvStaging, staged[i].rel);
+                std::string dst = pathJoin(finalDir, staged[i].rel);
+                ensureParentDirs(dst);
+                if (!MoveFileExA(src.c_str(), dst.c_str(),
+                                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                    ok = false;
+            }
+            // v47 tombstones: files the sender's save no longer contains (a
+            // stale platoon file would resurrect a dead squad on load).
+            if (ok && !g_recvDelPaths.empty()) {
+                unsigned int nDel = 0;
+                for (size_t i = 0; i < g_recvDelPaths.size(); ++i)
+                    if (DeleteFileA(pathJoin(finalDir, g_recvDelPaths[i]).c_str()))
+                        ++nDel;
+                char db[96];
+                _snprintf(db, sizeof(db) - 1,
+                          "[save] XFER delta deletions applied: %u/%u",
+                          nDel, (unsigned)g_recvDelPaths.size());
+                db[sizeof(db) - 1] = '\0'; coop::logLine(db);
+            }
+            if (ok) removeTree(g_recvStaging, 0);
+        }
+    } else if (ok) {
         // Commit: swap the staged folder over save/<name>/ - the previous
         // save is only removed AFTER the new one is in place.
         std::string finalDir = saveFolderFor(g_recvName);
@@ -668,12 +854,12 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
     if (outFiles) *outFiles = ok ? g_recvFileCount : 0;
     if (outBytes) *outBytes = ok ? g_recvBytes : 0;
 
-    char b[192];
+    char b[208];
     _snprintf(b, sizeof(b) - 1,
-              "[save] XFER-%s id=%u name='%s' files=%u bytes=%I64u badCrc=%u ms=%lu",
+              "[save] XFER-%s id=%u name='%s' files=%u bytes=%I64u badCrc=%u ms=%lu mode=%s",
               ok ? "COMMIT" : "FAILED", d.xferId, g_recvName.c_str(),
               (unsigned)g_recvFileCount, g_recvBytes, bad,
-              GetTickCount() - g_recvStartTick);
+              GetTickCount() - g_recvStartTick, g_recvDelta ? "delta" : "full");
     b[sizeof(b) - 1] = '\0';
     if (ok) coop::logLine(b); else coop::logErrLine(b);
     g_lastCommitResult = ok ? 1 : 0;
