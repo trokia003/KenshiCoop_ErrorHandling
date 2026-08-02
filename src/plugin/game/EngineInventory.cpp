@@ -287,6 +287,12 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
         }
         if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; }
         if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
+        // A minted item carries quantity 1, and tryAddItem(it, qty) can only add
+        // units the item actually holds - every qty>1 fabrication failed while
+        // qty=1 succeeded (2026-08-01 chest-transfer session). Stamp the stack
+        // size first. Equipment is qty 1 by contract, so this only fires for
+        // stackables.
+        if (qty > 1) it->quantity = qty;
         if (!inv->tryAddItem(it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
         // Equipment is non-stackable (qty 1); move the just-added item into its slot.
         if (equip && g_equipItemFn) g_equipItemFn(inv, it);
@@ -1509,6 +1515,13 @@ void* findGroundItemAt(GameWorld* gw, const char* sid, float x, float y, float z
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return best; }
     return best;
+}
+
+int itemIsFreeGround(void* item) {
+    if (!item) return 0;
+    __try {
+        return reinterpret_cast<Item*>(item)->isInInventory ? 0 : 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
 int destroyGroundItemPtr(GameWorld* gw, void* item) {

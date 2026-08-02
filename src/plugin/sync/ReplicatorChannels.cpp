@@ -862,6 +862,45 @@ inline int qProd(float v) {
 void Replicator::publishProd(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!prodSync_) return;
+    // v47: land the join's production intents FIRST, so this same pass streams
+    // the result back - the echo that makes the join's mined ore authoritative.
+    {
+        std::deque<InboundProdDelta> deltas;
+        ctx.in->drainProdDeltas(deltas);
+        for (std::deque<InboundProdDelta>::iterator it = deltas.begin();
+             it != deltas.end(); ++it) {
+            const ProdDeltaPacket& p = it->pkt;
+            std::pair<u32, u32> id(p.ownerId, p.deltaId);
+            if (appliedProdDeltas_.count(id) != 0) continue; // reliable resend
+            appliedProdDeltas_.insert(id);
+            if (appliedProdDeltas_.size() > 4096)
+                appliedProdDeltas_.erase(appliedProdDeltas_.begin());
+            if (p.outDelta <= 0.0f || p.outDelta > 1000.0f) continue; // sanity
+            unsigned int hand[5] = { p.key[0], p.key[1], p.key[2], p.key[3], p.key[4] };
+            engine::ProdRead cur;
+            if (!engine::readMachineByHand(hand, &cur) || !cur.complete) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[prod] DELTA-RECV id=%u key=%u.%u SKIP (unresolved here)",
+                    p.deltaId, p.key[3], p.key[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                continue;
+            }
+            float target = (cur.outAmount >= 0.0f ? cur.outAmount : 0.0f) + p.outDelta;
+            // Null output buffer: materialize via the native setProductionItem
+            // first (the applyProd-proven lever), then land the exact amount.
+            if (cur.outAmount < 0.0f)
+                engine::writeMachineByHand(hand, -1, target, /*useSetItem*/true,
+                                           0, 0, 0);
+            engine::ProdRead after;
+            bool ok = engine::writeMachineByHand(hand, -1, target,
+                                                 /*useSetItem*/false, 0, 0, &after);
+            char b[208]; _snprintf(b, sizeof(b) - 1,
+                "[prod] DELTA-RECV id=%u key=%u.%u.%u.%u.%u sid='%s' +%.3f -> %.3f ok=%d",
+                p.deltaId, p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                p.outSid, p.outDelta, after.outAmount, ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
     const unsigned long SAMPLE_MS = tuning_.prodSampleMs;  // machines tick slowly; 1 Hz is plenty
     const unsigned long RESEND_MS = tuning_.prodResendMs;  // safety resend = the join drift corrector
     unsigned long now = nowMs();
@@ -944,6 +983,54 @@ void Replicator::publishProd(const SyncContext& ctx) {
 
 void Replicator::applyProd(const SyncContext& ctx) {
     Inbound& in = *ctx.in;
+    // v47 join-side production intents: the JOIN's own workers mining/crafting
+    // write only its local sim - the host never saw the output and its stream
+    // then erased it ("his mined ore doesn't exist" report). Detect local
+    // output INCREASES on BAKED machines (~1 Hz) against the last value seen
+    // or applied and forward the delta; the host lands it authoritatively and
+    // its normal stream echoes the result to both. Session-placed machines
+    // stay host-authoritative-only for now (runtime-hand translation).
+    if (!ctx.isHost && prodSync_ && ctx.gw) {
+        unsigned long dnow = nowMs();
+        if (sync::gateSampleDue(dnow, prodDeltaScanMs_, 1000)) {
+            prodDeltaScanMs_ = dnow;
+            const unsigned int MAX_MACH = 48;
+            static engine::ProdRead drows[MAX_MACH]; // main-thread only
+            unsigned int dn = engine::enumMachinesNear(ctx.gw, 100.0f, drows, MAX_MACH);
+            for (unsigned int i = 0; i < dn; ++i) {
+                const engine::ProdRead& r = drows[i];
+                if (!r.complete) continue;
+                Key lk; lk.t = r.hand[0]; lk.c = r.hand[1]; lk.cs = r.hand[2];
+                lk.i = r.hand[3]; lk.s = r.hand[4];
+                // v1: baked machines only (shared save-stable hands).
+                if (ownBuilds_.find(lk) != ownBuilds_.end()) continue;
+                if (mintByLocal_.find(lk) != mintByLocal_.end()) continue;
+                float out = (r.outAmount >= 0.0f) ? r.outAmount : 0.0f;
+                std::map<Key, float>::iterator ex = prodExpected_.find(lk);
+                if (ex == prodExpected_.end()) { prodExpected_[lk] = out; continue; }
+                float delta = out - ex->second;
+                if (delta > 0.005f) {
+                    ex->second = out;
+                    ProdDeltaPacket pkt;
+                    memset(&pkt, 0, sizeof(pkt));
+                    pkt.type     = (u8)PKT_PROD_DELTA;
+                    pkt.ownerId  = ctx.localId;
+                    pkt.deltaId  = ++nextProdDeltaId_;
+                    for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = r.hand[h];
+                    pkt.outDelta = delta;
+                    strncpy(pkt.outSid, r.outSid, sizeof(pkt.outSid) - 1);
+                    ctx.net->queueProdDelta(pkt);
+                    char b[208]; _snprintf(b, sizeof(b) - 1,
+                        "[prod] DELTA-SEND id=%u key=%u.%u.%u.%u.%u sid='%s' +%.3f (local=%.3f)",
+                        pkt.deltaId, r.hand[0], r.hand[1], r.hand[2], r.hand[3],
+                        r.hand[4], r.outSid, delta, out);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                } else if (delta < -0.005f) {
+                    ex->second = out; // consumed / host correction: adopt silently
+                }
+            }
+        }
+    }
     std::deque<InboundProd> got;
     in.drainProd(got);
     if (got.empty()) return;
@@ -979,12 +1066,47 @@ void Replicator::applyProd(const SyncContext& ctx) {
             continue; // out-of-interest / not resolvable here - accepted edge
         if (!cur.complete)
             continue; // still a construction site here; protocol 27 will finish it
+        // v47: the host row is the authority the delta detector measures
+        // against - adopt it as the baseline so an echoed apply of our own
+        // delta is never re-read as fresh local production.
+        if (!ctx.isHost && p.outAmount >= 0.0f) {
+            Key ek; ek.t = hand[0]; ek.c = hand[1]; ek.cs = hand[2];
+            ek.i = hand[3]; ek.s = hand[4];
+            prodExpected_[ek] = p.outAmount;
+        }
+        // v47 surplus guard: on a BAKED machine, local output ABOVE the host
+        // row is production OUR sim just caused that the host hasn't landed
+        // yet - forward it now and keep our higher value, instead of letting
+        // the stale row erase the ore out from under the miner. The host's
+        // next row echoes the corrected total and everything converges.
+        bool suppressOutDown = false;
+        if (!ctx.isHost && p.keyKind == 0 && p.outAmount >= 0.0f &&
+            cur.outAmount > p.outAmount + 0.005f) {
+            float surplus = cur.outAmount - p.outAmount;
+            ProdDeltaPacket dp;
+            memset(&dp, 0, sizeof(dp));
+            dp.type    = (u8)PKT_PROD_DELTA;
+            dp.ownerId = ctx.localId;
+            dp.deltaId = ++nextProdDeltaId_;
+            for (unsigned int h = 0; h < 5; ++h) dp.key[h] = hand[h];
+            dp.outDelta = surplus;
+            strncpy(dp.outSid, cur.outSid, sizeof(dp.outSid) - 1);
+            ctx.net->queueProdDelta(dp);
+            Key ek; ek.t = hand[0]; ek.c = hand[1]; ek.cs = hand[2];
+            ek.i = hand[3]; ek.s = hand[4];
+            prodExpected_[ek] = cur.outAmount;
+            char sb[176]; _snprintf(sb, sizeof(sb) - 1,
+                "[prod] DELTA-SEND id=%u (surplus guard) key=%u.%u +%.3f",
+                dp.deltaId, hand[3], hand[4], surplus);
+            sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+            suppressOutDown = true;
+        }
         // Apply only what actually diverged, through the engine's own levers.
         int wantPower = -1;
         if (p.powerOn >= 0 && cur.powerOn >= 0 && (int)p.powerOn != cur.powerOn)
             wantPower = (int)p.powerOn;
         float outWant = -1.0f;
-        if (p.outAmount >= 0.0f &&
+        if (!suppressOutDown && p.outAmount >= 0.0f &&
             qProd(p.outAmount) != qProd(cur.outAmount >= 0.0f ? cur.outAmount : 0.0f))
             outWant = p.outAmount;
         float inWant[2] = { -1.0f, -1.0f };
@@ -1177,6 +1299,10 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
                 // (progress only rises; stale rows are no-ops by construction).
                 if (buildCensusSeeded_ && !fresh && !isOwn && !isProxy) {
                     BakedRow& br = bakedRows_[k];
+                    if (!br.sid[0] && sites[i].sid[0]) {
+                        strncpy(br.sid, sites[i].sid, sizeof(br.sid) - 1);
+                        br.sid[sizeof(br.sid) - 1] = '\0';
+                    }
                     float prog = sites[i].progress;
                     bool moved = (br.lastSent < 0.0f) ||
                                  (prog - br.lastSent >= 0.005f);
@@ -1211,21 +1337,26 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
             }
             // A tracked baked site that LEFT the incomplete census either
             // completed (send the latched complete=1 row so the peer finishes
-            // it natively) or unloaded (drop the row silently).
+            // it natively) or unloaded (drop the row silently). IDENTITY
+            // GUARD (2026-07-31 instant-complete session): the leave-census
+            // hand must still resolve to the SAME TEMPLATE we tracked - an
+            // unstable runtime hand can land on a different, complete
+            // building, and an unguarded latch then broadcast a false finish.
             for (std::map<Key, BakedRow>::iterator br = bakedRows_.begin();
                  br != bakedRows_.end(); ) {
                 if (walkSeen.count(br->first) != 0) { ++br; continue; }
                 unsigned int kh[5] = { br->first.t, br->first.c, br->first.cs,
                                        br->first.i, br->first.s };
                 engine::BuildRead cur;
-                if (engine::readBuildingByHand(kh, &cur) && cur.complete) {
+                if (engine::readBuildingByHand(kh, &cur) && cur.complete &&
+                    br->second.sid[0] && strcmp(cur.sid, br->second.sid) == 0) {
                     BuildStatePacket sp;
                     memset(&sp, 0, sizeof(sp));
                     sp.type = (u8)PKT_BUILD_STATE;
                     sp.ownerId = ctx.localId;
                     sp.seq = buildSeqOut_++;
                     for (unsigned int h = 0; h < 5; ++h) sp.key[h] = kh[h];
-                    sp.progress = 1.0f;
+                    sp.progress = cur.progress; // real material units
                     sp.complete = 1;
                     ctx.net->queueBuildState(sp);
                     coop::logLine("[build] BAKED-STATE complete=1 (shared site finished)");
@@ -1355,6 +1486,10 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         int rc = engine::placeBuildingAt(gw, p.sid, p.x, p.y, p.z, p.yaw,
                                          /*completed*/false, pb.localHand);
         pb.minted = (rc == 1) ? 1 : 0;
+        // v46: keep the Building* - the runtime hand above does not re-resolve
+        // (2026-07-30 session: every STATE row ok=0), so progress applies
+        // through the pointer.
+        pb.obj = (rc == 1) ? engine::lastMintedBuildingObj() : 0;
         if (pb.minted) {
             // Reverse translation (protocol 28): the door sampler and the
             // protocol-26 filter recognize this proxy by its LOCAL hand.
@@ -1385,11 +1520,16 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
             // natural no-op, so no seq guard is needed on this path).
             unsigned int kh[5] = { p.key[0], p.key[1], p.key[2], p.key[3], p.key[4] };
             engine::BuildRead cur;
+            // v47 scale fix: progress is MATERIAL UNITS with a per-template
+            // requirement only the engine knows - max-merge the raw number and
+            // let ONLY the peer's engine-complete flag finish the site (the
+            // old >=1.0 threshold completed a 6-plate refinery at one plate).
+            bool trustedComplete = (p.complete != 0);
             if (engine::readBuildingByHand(kh, &cur) && !cur.complete &&
-                (p.progress > cur.progress + 0.004f || p.complete)) {
+                (p.progress > cur.progress + 0.004f || trustedComplete)) {
                 engine::BuildRead post;
-                engine::writeBuildProgressByHand(kh, p.complete ? 1.0f : p.progress,
-                                                 &post);
+                engine::writeBuildProgressByHandEx(kh, p.progress, trustedComplete,
+                                                   &post);
                 char b[160];
                 _snprintf(b, sizeof(b) - 1,
                           "[build] BAKED-MERGE key=%u.%u.%u.%u.%u prog %.3f -> %.3f%s",
@@ -1412,8 +1552,15 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
                 continue; // already converged (resend)
             if (cur.complete) continue; // completion is latched locally
         }
+        // v46: apply through the minted Building* when we hold one - the
+        // runtime hand does not re-resolve (STATE rows all logged ok=0 in the
+        // 2026-07-30 session while the placer built to 70%). Completion rides
+        // ONLY the sender's engine-complete flag (v47 scale fix).
         engine::BuildRead post;
-        bool ok = engine::writeBuildProgressByHand(pb.localHand, p.progress, &post);
+        bool ok = pb.obj
+            ? engine::writeBuildProgressPtr(pb.obj, p.progress, p.complete != 0, &post)
+            : engine::writeBuildProgressByHandEx(pb.localHand, p.progress,
+                                                 p.complete != 0, &post);
         char b[208];
         _snprintf(b, sizeof(b) - 1,
                   "[build] STATE-RECV key=%u.%u.%u.%u.%u prog=%.3f complete=%u "
@@ -1441,7 +1588,13 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
             continue; // never minted here or already gone - nothing to remove
         PeerBuild& pb = f->second;
         pb.removed = true;
-        bool ok = engine::destroyBuildingByHand(gw, pb.localHand);
+        // v46: prefer the minted Building* (runtime hands do not re-resolve;
+        // destroyGroundItemPtr is a thin GameWorld::destroy wrapper and works
+        // on any RootObject).
+        bool ok = pb.obj
+            ? (engine::destroyGroundItemPtr(gw, pb.obj) != 0)
+            : engine::destroyBuildingByHand(gw, pb.localHand);
+        pb.obj = 0;
         char b[192];
         _snprintf(b, sizeof(b) - 1,
                   "[build] REMOVE-RECV key=%u.%u.%u.%u.%u ok=%d "
@@ -1946,12 +2099,19 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         }
     }
     if (speedMyReq_ < 0.0f) {
-        // First tick (or hooks unavailable): seed the request from the live
-        // engine state and announce it so the peer's arbitration seeds.
-        float mult = 0.0f; bool paused = false;
-        if (!engine::readGameSpeed(gw, &mult, &paused)) return;
-        speedMyReq_ = paused ? 0.0f : mult;
-        userActed = true;
+        if (isHost) {
+            // First tick (or hooks unavailable): seed the request from the live
+            // engine state and announce it so the peer's arbitration seeds.
+            float mult = 0.0f; bool paused = false;
+            if (!engine::readGameSpeed(gw, &mult, &paused)) return;
+            speedMyReq_ = paused ? 0.0f : mult;
+            userActed = true;
+        }
+        // JOIN: NO vote until a real user intent. A fresh world load parks the
+        // engine PAUSED - an engine default, not a player request - and
+        // seeding it as a vote meant every join/reload PAUSED the host's
+        // running game through the min() arbitration (2026-08-01 report).
+        // The host's SET stream drives our engine until the player acts.
     }
     if (userActed) {
         char b[112]; _snprintf(b, sizeof(b) - 1,
@@ -2043,8 +2203,12 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         }
     } else {
         // Join: send our request on change / combat edge / safety resend.
-        if (userActed || combatEdge || speedLastSendMs_ == 0 ||
-            (now - speedLastSendMs_) >= RESEND_MS) {
+        // With NO vote yet (speedMyReq_ < 0) a REQ only goes out for the
+        // combat cap (speed 1.0 == exactly what the cap enforces) - a votless
+        // resend would smuggle a phantom 1x vote into the min() arbitration.
+        if ((speedMyReq_ >= 0.0f || speedMyCombat_) &&
+            (userActed || combatEdge || speedLastSendMs_ == 0 ||
+             (now - speedLastSendMs_) >= RESEND_MS)) {
             SpeedPacket pkt;
             memset(&pkt, 0, sizeof(pkt));
             pkt.type    = (u8)PKT_SPEED_REQ;

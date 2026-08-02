@@ -281,7 +281,21 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             bool fought   = attackerOf_.find(k) != attackerOf_.end();
             bool down     = coop::bodyIsDown(e.bodyState) ||
                             (e.bodyState & BODY_DEAD) != 0;
-            if (fighting || fought || down) medNpc_[k] = nowPub;
+            // v46 wake-heal fix: qualification used to END the instant a KO'd
+            // NPC stood up (down=false, fighting=false), so the vitals stream
+            // quit exactly when the join's copy needed its post-coma wounds
+            // corrected - recovered enemies rendered fully healed there. Keep
+            // a recovered body qualified for a grace window past its last
+            // down sighting so the standing-up state streams too.
+            const unsigned long WAKE_GRACE_MS = 30000;
+            if (down) medDownLatch_[k] = nowPub;
+            bool recentlyDown = false;
+            {
+                std::map<Key, unsigned long>::iterator dl = medDownLatch_.find(k);
+                recentlyDown = (dl != medDownLatch_.end() &&
+                                nowPub - dl->second <= WAKE_GRACE_MS);
+            }
+            if (fighting || fought || down || recentlyDown) medNpc_[k] = nowPub;
         }
         // A combat intent's SUBJECT is a victim; if it's a world NPC (not a
         // player-squad body - those have their own owner-authoritative stream),
@@ -298,6 +312,12 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
              mit != medNpc_.end(); ) {
             if (nowPub - mit->second > MEDNPC_STALE_MS) medNpc_.erase(mit++);
             else ++mit;
+        }
+        // Age out the wake-grace latches too (bounded across brawls).
+        for (std::map<Key, unsigned long>::iterator dit = medDownLatch_.begin();
+             dit != medDownLatch_.end(); ) {
+            if (nowPub - dit->second > 30000) medDownLatch_.erase(dit++);
+            else ++dit;
         }
     }
 

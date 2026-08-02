@@ -45,8 +45,12 @@ struct CoopPanelState {
 // steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
 typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
 typedef void (*CoopDisconnectFn)();
+// Resync button (host with a live peer only - the row is hidden otherwise):
+// fired on click; the plugin root runs the coordinated save -> transfer ->
+// coordinated reload chain that puts both engines on an identical save.
+typedef void (*CoopResyncFn)();
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect);
+                   CoopDisconnectFn onDisconnect, CoopResyncFn onResync);
 
 // Persistent co-op connection-status overlay: a single ScreenLabel tracked to the
 // local leader (the spike-47/48 screenshot-proven render path) whose caption shows

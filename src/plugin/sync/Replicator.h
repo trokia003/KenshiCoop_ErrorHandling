@@ -1080,7 +1080,13 @@ private:
         u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
         char stringID[48]; u32 itemType; u16 quantity; u16 quality; bool baseline;
     };
-    struct WorldProxy { RootObject* obj; float x, y, z; u32 hash; };
+    // sid rides along (v47) so a locally-picked-up proxy can notify its author
+    // via WORLD_TAKE - the missing conservation direction for non-gear items.
+    struct WorldProxy {
+        RootObject* obj; float x, y, z; u32 hash;
+        char sid[48];
+        WorldProxy() : obj(0), x(0), y(0), z(0), hash(0) { sid[0] = '\0'; }
+    };
     std::map<Key, WorldTrack> worldTrack_;
     // Spawned proxies for PEER-authored ground items, keyed by (ownerId, netId):
     // W1 is bidirectional (each client streams the free ground items it authors),
@@ -1127,6 +1133,18 @@ private:
     // v46 baseline TAKE notices (ghost fix): outbound id + inbound idempotency.
     u32                               nextTakeId_;
     std::set<std::pair<u32, u32> >    appliedTakes_;
+    // v47 join-side production intents (the "his mined ore doesn't exist"
+    // report): per BAKED machine, the last output amount this client saw or
+    // applied - a local INCREASE beyond it is production our sim caused, and
+    // streams to the host as a PROD_DELTA. Host side: idempotency for the
+    // applied intents.
+    std::map<Key, float>              prodExpected_;
+    unsigned long                     prodDeltaScanMs_;
+    u32                               nextProdDeltaId_;
+    std::set<std::pair<u32, u32> >    appliedProdDeltas_;
+    // v46 native-twin adoption: netIds of tracks handed over to the peer's
+    // stream - the next publish pass emits their REMOVEs (retraction).
+    std::vector<u32>                  retractNetIds_;
 
     // Protocol 37 cross-owner transfer state.
     // xferBase_: last-known per-item totals (sid,type)->qty per tracked container - the
@@ -1408,7 +1426,11 @@ private:
         unsigned int localHand[5];
         int minted; u32 seqSeen;
         bool removed; // proxy destroyed on a REMOVE: tombstone (rows skip)
-        PeerBuild() : minted(0), seqSeen(0), removed(false) { memset(localHand, 0, sizeof(localHand)); }
+        // v46: the minted Building* - runtime hands do not re-resolve, so
+        // STATE rows apply through this pointer (SEH-guarded; session reset
+        // clears the map and the despawn pass destroys the object first).
+        void* obj;
+        PeerBuild() : minted(0), seqSeen(0), removed(false), obj(0) { memset(localHand, 0, sizeof(localHand)); }
     };
     std::map<Key, OwnBuild>  ownBuilds_;
     std::map<Key, PeerBuild> peerBuilds_;
@@ -1434,7 +1456,12 @@ private:
     // keyed by save-stable hand; apply side merges by MAX - no owner).
     struct BakedRow {
         float lastSent; unsigned long lastSendMs;
-        BakedRow() : lastSent(-1.0f), lastSendMs(0) {}
+        // v47: the site's template sid, captured at first tracking - the
+        // completion latch verifies the leave-census hand still resolves to
+        // the SAME template before trusting its complete flag (an unstable
+        // runtime hand can land on a different, complete building).
+        char sid[48];
+        BakedRow() : lastSent(-1.0f), lastSendMs(0) { sid[0] = '\0'; }
     };
     std::map<Key, BakedRow> bakedRows_;
     // Protocol 28 placed-door rows, keyed by (placer building key, door
@@ -1633,6 +1660,11 @@ private:
     // fight. Also the authority set for TREATMENTS on world NPCs (a join medic
     // bandaging a downed host NPC forwards here).
     std::map<Key, unsigned long> medNpc_;
+    // v46 wake-heal fix: last time each streamed world NPC was seen DOWN -
+    // keeps it vitals-qualified through a grace window past recovery, so the
+    // join's copy gets its post-coma wound state instead of rendering the
+    // stand-up fully healed.
+    std::map<Key, unsigned long> medDownLatch_;
 
     // Consensus game-speed sync state. Requests and applied values use ONE
     // number: the multiplier, with 0 meaning paused (min() then gives "either

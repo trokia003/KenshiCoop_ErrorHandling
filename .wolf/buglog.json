@@ -103,5 +103,42 @@
                      "item-dup",
                      "ghost"
                  ]
+    },
+    {
+        "date":  "2026-07-31",
+        "error_message":  "prototest FAIL 433/435: sizeof(SaveBeginPacket) 68 != expected 67, PROTOCOL_VERSION 47 != expected 45 - contract expectations were never bumped with the v46/v47 wire changes",
+        "root_cause":  "v46 added SaveBeginPacket.delta (+1 byte) and v46/v47 bumped PROTOCOL_VERSION, but src/prototest/main.cpp kept the v45 expected values; earlier green runs predate the rebuild of prototest against the new Wire.h",
+        "fix":  "updated the two expectations (68 with a v46 +delta note; version check now names v47) - 435/435 PASS. Rule: every Wire.h layout/version change must touch the prototest CHECK_EQ table in the same batch",
+        "tags":  [
+                     "prototest",
+                     "contract-tests",
+                     "wire",
+                     "protocol"
+                 ]
+    },
+    {
+        "date":  "2026-08-01",
+        "error_message":  "Join chest deposits invisible to host; host log [xfer] APPLY moved=0 fab=0 (qty=2) with sporadic qty=1 successes; host authored bogus chest-\u003echest intents + [xfer] defer-expired churn",
+        "root_cause":  "THREE stacked defects: (1) coopUiConnect never re-derives role-latched wiring - a default-HOST config that picks JOIN in the F2 panel keeps storeSync_ ON and census-authors world chests (dual-writer: deposits become own-\u003eown on the join, no intent authored, and neither side reconciles the other); also reportCombat/gateAuthority stayed host-mode. (2) detectAndPublishTransfers/applyTransfers ownership tests omit censusContainers_, so the HOST treats its own census-authored chests as peer - bogus intents + latches against its own snapshots. (3) createItemAndAdd mints a 1-unit Item then tryAddItem(it, qty) - every qty\u003e1 fabrication fails (qty=1 worked)",
+        "fix":  "coopUiConnect re-derives setStoreSync/setReportCombat/setGateAuthority from the panel role; censusContainers_ added to both srcOwn/dstOwn tests; it-\u003equantity = qty stamped before tryAddItem",
+        "tags":  [
+                     "xferSync",
+                     "storeSync",
+                     "container",
+                     "role-flip",
+                     "dup"
+                 ]
+    },
+    {
+        "date":  "2026-08-01",
+        "error_message":  "Join placing materials into construction sites invisible on host (animation + progress + completion synced, materials not)",
+        "root_cause":  "construction-site material inventories had NO channel: enumContainersNear skipped every incomplete site (isComplete filter), so the protocol-34 container census never authored them",
+        "fix":  "enumContainersNear authors INCOMPLETE sites regardless of container class (their inventory is the materials); inventory-less sites drop at the hasInv filter. Site deposits now ride the normal census-snapshot + xfer-intent flow",
+        "tags":  [
+                     "storeSync",
+                     "construction",
+                     "site-materials",
+                     "container"
+                 ]
     }
 ]

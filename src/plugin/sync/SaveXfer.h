@@ -92,6 +92,10 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name);
 // a reconnecting peer's disk state must be re-proven by a full send).
 void resetPeerState();
 bool sending();
+// HOST: monotonic count of XFER-SKIPs (beginSend found the peer's committed
+// copy byte-identical and sent nothing - no ACK will follow). The resync
+// driver treats a skip as transfer-complete.
+u32  skipSeq();
 // Pump the active transfer (call every main-loop tick; internally throttled).
 // Logs "[save] XFER-SENT ..." and returns true on the tick the DONE goes out.
 bool tickSend(NetLink& net, u32 localId);

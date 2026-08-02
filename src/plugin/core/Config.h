@@ -300,6 +300,28 @@ struct Config {
     // modes). "0" is the A/B escape hatch.
     bool          spawnSync;
 
+    // KENSHICOOP_SPAWN_VETO (default ON): join world-spawn veto - while a join
+    // session is live (peer present, world live, not host), the local
+    // ZoneManager spawn-checks ticker is skipped at the detour, so this engine
+    // never generates ambient wildlife / roaming squads of its own. In a live
+    // session the host census is the sole NPC-existence authority: every
+    // locally-generated squad is a census-absent ghost that renders for
+    // seconds before the wide-radius cull hides it (and stays visible through
+    // census-stale windows on a starving link). Vetoing at the source removes
+    // the whole class. Solo play and the host are untouched (the flag never
+    // arms); disconnect disarms it the same tick. "0" is the A/B escape hatch.
+    bool          spawnVeto;
+
+    // KENSHICOOP_TOWN_VETO (default ON): join town-flavor veto - same arm gate
+    // as spawnVeto, but for Town::spawnTheBarFlies (per-visit bar patrons).
+    // The host rolls barflies for the join's location too (shared player
+    // faction keeps those zones simulated host-side) and they arrive as
+    // census/spawn-info proxies, so the join's own roll only produced ghost
+    // doubles. Separate knob because the risk profile differs: if a bar ever
+    // sits empty on the join with the host nearby, "0" restores local rolls
+    // without touching the wildlife veto.
+    bool          townVeto;
+
     // KENSHICOOP_RECRUIT_SYNC (default ON): recruitment sync (protocol 23) -
     // a detour on PlayerInterface::recruit authors a reliable EVT_RECRUIT
     // (old hand -> new hand) for every successful local recruit; the peer
@@ -396,6 +418,28 @@ struct Config {
     // KENSHICOOP_RISK_SAVE_INTERVAL_S (default 180): minimum seconds between
     // risk checkpoints - raid waves must not turn into a save storm.
     unsigned int  riskSaveIntervalSec;
+
+    // KENSHICOOP_DLL_PUSH (default ON): v48 in-band DLL auto-update. The HOST
+    // pushes its own KenshiCoop.dll to a join whose build differs - either a
+    // protocol-mismatched HELLO (the handshake is HELD open for the push
+    // instead of rejected) or a same-protocol fingerprint mismatch reported by
+    // the join's PKT_BUILD_INFO. The join stages the image, rename-swaps it
+    // under the loaded DLL and prompts a restart. Both sides need >= v48 once
+    // (the last Discord-delivered update); after that new builds flow in-band.
+    bool          dllPush;
+
+    // KENSHICOOP_LOG_SHIP (default ON): the JOIN ships each finished MP log
+    // segment (and, on connect, any unshipped segments from earlier runs -
+    // crash survivors included) to the host over the file-push channel; the
+    // host stores them under KenshiCoopLogs\peer\. Gives the host both sides'
+    // logs for debugging without manual file swapping.
+    bool          logShip;
+    // KENSHICOOP_LOG_SEG_MIN (default 15): minutes of log data per segment.
+    unsigned int  logSegMin;
+    // KENSHICOOP_LOG_MAX_FILES (default 100): per-folder segment cap (own
+    // segments and received peer segments are capped independently; oldest
+    // deleted first).
+    unsigned int  logMaxFiles;
 
     // KENSHICOOP_LOAD_SYNC (default ON): coordinated load (protocol 32) -
     // a mid-session load on the HOST (menu or programmatic - the
@@ -510,6 +554,14 @@ void loadConfig(Config& out);
 // coop_config.json into 'c'. Called on the panel's Connect so a friend-code edit
 // applies without restarting the game. No-op for keys absent from the file.
 void reloadPeerFromFile(Config& c);
+
+// Persist the friend code: write 'steamPeer' back into coop_config.json (the
+// same file loadConfig/reloadPeerFromFile read), replacing the existing key
+// line in place - comments and other keys survive - or inserting one, or
+// creating a minimal file when none exists. Called by the F2 panel on a
+// VALIDATED paste, so the next launch has the friend pre-loaded and the
+// clipboard swap is a one-time step per friendship, not per session.
+void savePeerToFile(unsigned long long steamPeer);
 
 // One-line summary of the RESOLVED (effective) config - every sync channel's
 // on/off state plus the key tuning knobs - for the startup log. Makes "which

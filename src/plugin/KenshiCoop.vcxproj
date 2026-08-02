@@ -115,6 +115,7 @@
     <ClCompile Include="CoopLog.cpp" />
     <ClCompile Include="core\Config.cpp" />
     <ClCompile Include="core\CrashGuard.cpp" />
+    <ClCompile Include="core\SelfUpdate.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="net\SteamInvite.cpp" />
@@ -141,6 +142,7 @@
     <ClCompile Include="sync\ReplicatorItems.cpp" />
     <ClCompile Include="sync\ReplicatorChannels.cpp" />
     <ClCompile Include="sync\SaveXfer.cpp" />
+    <ClCompile Include="sync\FilePush.cpp" />
     <!-- Scenario harness: EXCLUDED from the shipped Release DLL, compiled in
          Debug + Harness. Keep this exclusion list in sync with the scenario
          drift check (scripts/tests/Contract.Tests.ps1). -->
@@ -195,12 +197,14 @@
     <ClInclude Include="core\Config.h" />
     <ClInclude Include="core\CrashGuard.h" />
     <ClInclude Include="core\Inbound.h" />
+    <ClInclude Include="core\SelfUpdate.h" />
     <ClInclude Include="net\NetLink.h" />
     <ClInclude Include="net\SteamP2P.h" />
     <ClInclude Include="game\Engine.h" />
     <ClInclude Include="sync\Interp.h" />
     <ClInclude Include="sync\Replicator.h" />
     <ClInclude Include="sync\SaveXfer.h" />
+    <ClInclude Include="sync\FilePush.h" />
     <ClInclude Include="test\Scenario.h" />
     <ClInclude Include="test\ScenarioTimed.h" />
     <ClInclude Include="test\ScenarioSupport.h" />

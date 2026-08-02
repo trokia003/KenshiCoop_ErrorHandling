@@ -96,6 +96,13 @@ struct InboundWorldTake {
     WorldTakePacket pkt;
 };
 
+// One received join->host production intent (v47): the join's local sim
+// produced machine output the host must land authoritatively.
+struct InboundProdDelta {
+    u32             ownerId;
+    ProdDeltaPacket pkt;
+};
+
 // One received cross-owner TRANSFER intent (protocol 37): a peer performed a
 // direct UI drag between two containers, at least one of which it does not
 // author. The receiver relocates the REAL item between its own copies of the
@@ -313,6 +320,42 @@ struct InboundCamHint {
     CamHintPacket pkt;
 };
 
+// ---- v48 generic file push + build fingerprint -------------------------------
+// One received file-push announce (either direction).
+struct InboundFileBegin {
+    u32                 ownerId;
+    FilePushBeginPacket hdr;
+    std::string         name; // hdr.nameLen bytes (file NAME only, no path)
+};
+// One received file-push chunk.
+struct InboundFileChunk {
+    u32                 ownerId;
+    FilePushChunkPacket hdr;
+    std::vector<u8>     data; // hdr.dataLen bytes
+};
+// One received file-push end marker.
+struct InboundFileDone {
+    u32                ownerId;
+    FilePushDonePacket pkt;
+};
+// One received file-push verdict (sender side).
+struct InboundFileAck {
+    u32               ownerId;
+    FilePushAckPacket pkt;
+};
+// One received build fingerprint (host side; join sends after WELCOME).
+struct InboundBuildInfo {
+    u32             ownerId;
+    BuildInfoPacket pkt;
+};
+// One version-mismatch hold (host side, NET thread): a peer HELLO'd with a
+// different PROTOCOL_VERSION and the DLL-push hold kept the connection open
+// (no WELCOME) so the main thread can push our build.
+struct InboundVerMismatch {
+    u32 peerId;
+    u16 version; // the peer's protocol version
+};
+
 // --- Structural world-state classification (Phase 4) -------------------------
 // Every inbound queue is exactly one of two kinds, chosen at its DECLARATION:
 //   WorldQ<T>   - describes the CURRENT world; dropped on a session-reset edge
@@ -381,7 +424,7 @@ public:
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    wp_(worldReset_),
-        wt_(worldReset_),
+        wt_(worldReset_),         prodDelta_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
@@ -476,6 +519,11 @@ public:
     void pushWorldTake(u32 ownerId, const WorldTakePacket& pkt) {
         InboundWorldTake wt; wt.ownerId = ownerId; wt.pkt = pkt;
         EnterCriticalSection(&cs_); wt_.push_back(wt); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received production intent (v47), owner-tagged.
+    void pushProdDelta(u32 ownerId, const ProdDeltaPacket& pkt) {
+        InboundProdDelta pd; pd.ownerId = ownerId; pd.pkt = pkt;
+        EnterCriticalSection(&cs_); prodDelta_.push_back(pd); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received cross-owner transfer intent (protocol 37), owner-tagged.
     void pushInvXfer(u32 ownerId, const InvXferPacket& pkt) {
@@ -619,6 +667,39 @@ public:
         InboundCamHint ch; ch.ownerId = ownerId; ch.pkt = pkt;
         EnterCriticalSection(&cs_); camHint_.push_back(ch); LeaveCriticalSection(&cs_);
     }
+    // NET thread: v48 file-push packets + build fingerprint, owner-tagged.
+    // Session-preserving: a DLL push runs on a HELD version-mismatched
+    // connection (no world), and a log segment must survive a world swap.
+    void pushFileBegin(u32 ownerId, const FilePushBeginPacket& hdr, const char* name) {
+        InboundFileBegin fb;
+        fb.ownerId = ownerId;
+        fb.hdr     = hdr;
+        fb.name.assign(name, name + hdr.nameLen);
+        EnterCriticalSection(&cs_); fileBegin_.push_back(fb); LeaveCriticalSection(&cs_);
+    }
+    void pushFileChunk(u32 ownerId, const FilePushChunkPacket& hdr, const u8* data) {
+        InboundFileChunk fc;
+        fc.ownerId = ownerId;
+        fc.hdr     = hdr;
+        if (data && hdr.dataLen > 0) fc.data.assign(data, data + hdr.dataLen);
+        EnterCriticalSection(&cs_); fileChunk_.push_back(fc); LeaveCriticalSection(&cs_);
+    }
+    void pushFileDone(u32 ownerId, const FilePushDonePacket& pkt) {
+        InboundFileDone fd; fd.ownerId = ownerId; fd.pkt = pkt;
+        EnterCriticalSection(&cs_); fileDone_.push_back(fd); LeaveCriticalSection(&cs_);
+    }
+    void pushFileAck(u32 ownerId, const FilePushAckPacket& pkt) {
+        InboundFileAck fa; fa.ownerId = ownerId; fa.pkt = pkt;
+        EnterCriticalSection(&cs_); fileAck_.push_back(fa); LeaveCriticalSection(&cs_);
+    }
+    void pushBuildInfo(u32 ownerId, const BuildInfoPacket& pkt) {
+        InboundBuildInfo bi; bi.ownerId = ownerId; bi.pkt = pkt;
+        EnterCriticalSection(&cs_); buildInfo_.push_back(bi); LeaveCriticalSection(&cs_);
+    }
+    void pushVerMismatch(u32 peerId, u16 version) {
+        InboundVerMismatch vm; vm.peerId = peerId; vm.version = version;
+        EnterCriticalSection(&cs_); verMismatch_.push_back(vm); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
@@ -653,6 +734,9 @@ public:
     }
     void drainWorldTakes(std::deque<InboundWorldTake>& out) {
         EnterCriticalSection(&cs_); out.swap(wt_); LeaveCriticalSection(&cs_);
+    }
+    void drainProdDeltas(std::deque<InboundProdDelta>& out) {
+        EnterCriticalSection(&cs_); out.swap(prodDelta_); LeaveCriticalSection(&cs_);
     }
     void drainInvXfers(std::deque<InboundInvXfer>& out) {
         EnterCriticalSection(&cs_); out.swap(invXfer_); LeaveCriticalSection(&cs_);
@@ -738,6 +822,24 @@ public:
     void drainCamHints(std::deque<InboundCamHint>& out) {
         EnterCriticalSection(&cs_); out.swap(camHint_); LeaveCriticalSection(&cs_);
     }
+    void drainFileBegins(std::deque<InboundFileBegin>& out) {
+        EnterCriticalSection(&cs_); out.swap(fileBegin_); LeaveCriticalSection(&cs_);
+    }
+    void drainFileChunks(std::deque<InboundFileChunk>& out) {
+        EnterCriticalSection(&cs_); out.swap(fileChunk_); LeaveCriticalSection(&cs_);
+    }
+    void drainFileDones(std::deque<InboundFileDone>& out) {
+        EnterCriticalSection(&cs_); out.swap(fileDone_); LeaveCriticalSection(&cs_);
+    }
+    void drainFileAcks(std::deque<InboundFileAck>& out) {
+        EnterCriticalSection(&cs_); out.swap(fileAck_); LeaveCriticalSection(&cs_);
+    }
+    void drainBuildInfos(std::deque<InboundBuildInfo>& out) {
+        EnterCriticalSection(&cs_); out.swap(buildInfo_); LeaveCriticalSection(&cs_);
+    }
+    void drainVerMismatches(std::deque<InboundVerMismatch>& out) {
+        EnterCriticalSection(&cs_); out.swap(verMismatch_); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread, session reset (protocol 32): drop every queued packet that
     // describes the OLD world after a reload / reconnect / disconnect edge, and
@@ -787,6 +889,7 @@ private:
     WorldQ<InboundInvXfer>         invXfer_;
     WorldQ<InboundWorldPickup>     wp_;
     WorldQ<InboundWorldTake>       wt_;
+    WorldQ<InboundProdDelta>       prodDelta_;
     WorldQ<InboundMedical>         med_;
     WorldQ<InboundTreatment>       treat_;
     WorldQ<InboundCombatHit>       combatHit_;
@@ -817,6 +920,16 @@ private:
     SessionQ<InboundLoadGo>        loadGo_;
     SessionQ<InboundLoadReq>       loadReq_;
     SessionQ<InboundLoadNack>      loadNack_;
+
+    // SESSION-PRESERVING: v48 file push + build fingerprint. A DLL push runs
+    // on a held mismatched connection with no world at all, and a mid-swap
+    // log-segment chunk must not be dropped.
+    SessionQ<InboundFileBegin>     fileBegin_;
+    SessionQ<InboundFileChunk>     fileChunk_;
+    SessionQ<InboundFileDone>      fileDone_;
+    SessionQ<InboundFileAck>       fileAck_;
+    SessionQ<InboundBuildInfo>     buildInfo_;
+    SessionQ<InboundVerMismatch>   verMismatch_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

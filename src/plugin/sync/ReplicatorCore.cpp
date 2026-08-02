@@ -37,6 +37,7 @@ Replicator::Replicator()
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
       nextWorldNetId_(1), worldSeeded_(false),
       nextDropId_(1), nextPickupId_(1), nextTakeId_(1), nextXferId_(1),
+      prodDeltaScanMs_(0), nextProdDeltaId_(1),
       xferScanMs_(0), nextTreatId_(1),
       quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
       dmgGuard_(false), reportCombat_(false), nextHitId_(1),
@@ -226,6 +227,10 @@ void Replicator::resetSession() {
     appliedDrops_.clear();
     appliedPickups_.clear();
     appliedTakes_.clear(); // v46 baseline TAKE idempotency
+    retractNetIds_.clear(); // v46 adoption retractions (stale netIds after swap)
+    prodExpected_.clear();  // v47 production-delta baselines (stale hands after swap)
+    appliedProdDeltas_.clear();
+    prodDeltaScanMs_ = 0;
     groundedWeapons_.clear();
     // Protocol 37: every container hand and Item* baseline is stale in the new world.
     xferBase_.clear();
@@ -239,6 +244,7 @@ void Replicator::resetSession() {
     medPub_.clear();
     medRecv_.clear();
     medNpc_.clear();
+    medDownLatch_.clear(); // v46 wake-heal grace latches (stale hands after swap)
     statsPub_.clear();
     moneyPub_.clear();
     moneyExpected_ = -1; // v46 shared wallet: re-seed from the reloaded world

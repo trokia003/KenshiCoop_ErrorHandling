@@ -123,6 +123,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.dead  = dead ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
             net.queueSpawnInfo(pkt);
+            // v46 wake-heal fix (mint half): the join is about to MINT this
+            // body from its template - full health by construction, whatever
+            // wounds the real one carries. Qualify it for the NPC vitals
+            // stream so the mint's real blood/limb state lands within ~1 s
+            // (a healthy body streams one cheap row and ages back out).
+            if (found && streamNpcs_) medNpc_[k] = nowMs();
             char b[224]; _snprintf(b, sizeof(b) - 1,
                 "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,

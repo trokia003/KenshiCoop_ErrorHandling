@@ -25,12 +25,16 @@
 #include <cstdio>
 #include <string>
 #include <deque>
+#include <vector>
+#include <algorithm> // std::sort (peer log-dir pruning)
+#include <utility>   // std::make_pair
 
 #include "CoopLog.h"
 #include "core/Config.h"
 #include "core/CrashGuard.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
+#include "core/SelfUpdate.h"     // v48 DLL auto-update (fingerprint + swap)
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
@@ -39,6 +43,7 @@
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
+#include "sync/FilePush.h"       // v48 generic in-band file channel
 #ifdef KENSHICOOP_HARNESS
 #include "test/Scenario.h" // scenario runner: Harness/Debug builds only (Phase 1)
 #endif
@@ -70,6 +75,35 @@ coop::u32        g_tick = 0;
 // minted proxies (NPC + world-item, Phase 3) through this cached pointer to
 // avoid leaking duplicate bodies into the save. Only touched on the main thread.
 GameWorld*       g_lastGw = 0;
+
+// ---- v48 in-band DLL auto-update + MP log shipping state ---------------------
+// (drained/driven by tickFilePush; declared up here because coopPanelDrive
+// reads g_updateNotice for the panel status line). Main thread only.
+std::string             g_updateNotice;         // non-empty: restart-required banner
+bool                    g_logShipRescan = false;// join: scan disk for unshipped segments
+std::deque<std::string> g_logShipQueue;         // segment paths awaiting shipping
+std::string             g_logShipInFlight;      // path currently being pushed ("" = none)
+DWORD                   g_updateRestartDue = 0; // != 0: auto-restart at this tick (menu update)
+
+// The DLL updater's restart handshake file (beside the DLL): written before
+// the automatic relaunch so the NEXT session reconnects without any F2 input.
+std::string updateReconnectFlagPath() {
+    char self[MAX_PATH];
+    if (!coop::selfupdate::selfPath(self, sizeof(self))) return std::string();
+    std::string p(self);
+    size_t cut = p.find_last_of("\\/");
+    if (cut == std::string::npos) return std::string();
+    return p.substr(0, cut) + "\\coop_reconnect.tmp";
+}
+
+// Segments live beside the main log in KenshiCoopLogs\ (peer copies under
+// KenshiCoopLogs\peer\).
+std::string logSegmentsDir() {
+    std::string dir = g_cfg.logPath;
+    size_t cut = dir.find_last_of("\\/");
+    dir = (cut == std::string::npos) ? std::string(".") : dir.substr(0, cut);
+    return dir + "\\KenshiCoopLogs";
+}
 
 // Cross-owner trade veto owner classifier (engine InvOwnerClassFn): forwards a
 // save-stable owner hand to the Replicator's squad-ownership sets. Free function
@@ -187,6 +221,10 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 void startNetworking();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
 void coopUiDisconnect();
+void coopUiResync();
+// Resync request latch (F2 button -> tickCoordinatedSaveLoad's driver). Main
+// thread only: set by the panel callback, consumed the same tick or the next.
+bool g_resyncRequested = false;
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
 // and the engine's kenshi.log (handy when attached live).
@@ -292,6 +330,22 @@ void processNetEvents(GameWorld* gw) {
         // mainLoop_hook arms this instead - covers either connect ordering.
         if (g_cfg.isHost && g_cfg.saveSync && g_gameStarted)
             armConnectPush();
+        // v48 (join): report our build fingerprint so a host on a NEWER build
+        // of the SAME protocol pushes its DLL, and rescan for unshipped log
+        // segments from earlier runs (crash survivors included).
+        if (!g_cfg.isHost) {
+            coop::u32 crc = 0, size = 0;
+            if (coop::selfupdate::selfInfo(&crc, &size)) {
+                coop::BuildInfoPacket bi;
+                bi.type     = (coop::u8)coop::PKT_BUILD_INFO;
+                bi.ownerId  = g_net.localId();
+                bi.protoVer = coop::PROTOCOL_VERSION;
+                bi.dllCrc   = crc;
+                bi.dllSize  = size;
+                g_net.queueBuildInfo(bi);
+            }
+            if (g_cfg.logShip) g_logShipRescan = true;
+        }
     }
     for (std::deque<coop::u32>::iterator it = leaves.begin(); it != leaves.end(); ++it) {
         char b[64];
@@ -306,6 +360,13 @@ void processNetEvents(GameWorld* gw) {
         // v46 delta transfers: a reconnecting peer's disk state must be
         // re-proven, so the next send after any disconnect is a FULL one.
         coop::savexfer::resetPeerState();
+        // v48 file push: abort in-flight transfers; an unfinished log shipment
+        // goes back on the queue (its file is still on disk, un-.sent).
+        coop::filepush::resetPeer();
+        if (!g_logShipInFlight.empty()) {
+            g_logShipQueue.push_back(g_logShipInFlight);
+            g_logShipInFlight.clear();
+        }
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
@@ -757,6 +818,8 @@ void coopPanelDrive(GameWorld* gw) {
         detail = "Offline - press F2, then set Connection to ONLINE";
         ostate = 0;
     }
+    // v48 DLL update landed: the restart requirement outranks any session state.
+    if (!g_updateNotice.empty()) { detail = g_updateNotice; ostate = 1; }
     ps.detail = detail.c_str();
 
     // Join save-transfer status for the panel: while a join streams the host's
@@ -788,7 +851,8 @@ void coopPanelDrive(GameWorld* gw) {
     // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
     coop::steaminvite::tick();
 
-    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
+    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect,
+                                &coopUiResync);
     coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
 }
 
@@ -1229,6 +1293,81 @@ void tickCoordinatedSaveLoad(GameWorld* gw) {
             }
         }
         } // peer-settle gate scope
+        // Resync (F2 button, host): put both engines back on one identical
+        // save. Chain: saveGameAs('coop_resync') -> the normal protocol-31
+        // quiescence/transfer -> join commit ACK (or an XFER-SKIP: its copy
+        // was already byte-identical) -> loadSave('coop_resync'), whose detour
+        // edge broadcasts LOAD_GO so the join reloads the same folder. If an
+        // unrelated save edge (autosave) steals the pipeline mid-chain, the
+        // reload still converges: the join NACKs the fingerprint mismatch and
+        // driveLoadSync's fallback transfer re-streams before its load.
+        {
+            static int   s_resyncState = 0; // 0 idle, 1 streaming, 2 loading
+            static coop::u32 s_ackBase  = 0;
+            static coop::u32 s_skipBase = 0;
+            static DWORD s_resyncStart  = 0;
+            const unsigned long RESYNC_XFER_TIMEOUT_MS = 300000;
+            const unsigned long RESYNC_LOAD_TIMEOUT_MS = 30000;
+            if (g_resyncRequested) {
+                g_resyncRequested = false;
+                if (s_resyncState != 0) {
+                    coopLog("[resync] ignored (already in progress)");
+                } else if (!(g_cfg.isHost && g_cfg.saveSync && g_cfg.loadSync &&
+                             g_peerPresent && gw && g_swapStartTick == 0 &&
+                             !g_bootstrapArmed &&
+                             !coop::savexfer::watching() &&
+                             !coop::savexfer::sending())) {
+                    coopLog("[resync] ignored (needs host + live peer + no save/load in flight)");
+                } else if (coop::engine::saveGameAs("coop_resync")) {
+                    s_ackBase     = coop::savexfer::lastAckXferId();
+                    s_skipBase    = coop::savexfer::skipSeq();
+                    s_resyncStart = GetTickCount();
+                    s_resyncState = 1;
+                    // Freeze both worlds for the transfer: the LOUD write
+                    // registers as the host's PAUSE VOTE, so the speed
+                    // consensus pauses the join too. min() arbitration keeps
+                    // it held until someone unpauses after the reload.
+                    if (coop::engine::writeGameSpeed(gw, 0.0f, true))
+                        coopLog("[resync] both worlds pausing for the transfer");
+                    coopLog("[resync] STARTED: saving 'coop_resync' (transfer, then both reload)");
+                } else {
+                    coopErr("[resync] save failed to issue");
+                }
+            }
+            if (s_resyncState == 1) {
+                if (!g_peerPresent) {
+                    s_resyncState = 0;
+                    coopErr("[resync] aborted (peer left during transfer)");
+                } else if (coop::savexfer::lastAckXferId() != s_ackBase) {
+                    if (coop::savexfer::lastAckOk() == 1) {
+                        s_resyncState = 2;
+                        coopLog("[resync] join committed 'coop_resync'; issuing coordinated reload");
+                    } else {
+                        s_resyncState = 0;
+                        coopErr("[resync] aborted (join failed to verify/commit the transfer; press Resync again)");
+                    }
+                } else if (coop::savexfer::skipSeq() != s_skipBase) {
+                    s_resyncState = 2;
+                    coopLog("[resync] join copy already identical; issuing coordinated reload");
+                } else if (GetTickCount() - s_resyncStart >= RESYNC_XFER_TIMEOUT_MS) {
+                    s_resyncState = 0;
+                    coopErr("[resync] aborted (transfer timeout)");
+                }
+            }
+            if (s_resyncState == 2) {
+                // loadSave is deferred-signal based; retry until the save
+                // subsystem accepts it (same shape as the title auto-load).
+                if (coop::engine::loadSave("coop_resync")) {
+                    s_resyncState = 0;
+                    warnIfNoPortraits("coop_resync");
+                    coopLog("[resync] reload issued; LOAD_GO will broadcast to the join");
+                } else if (GetTickCount() - s_resyncStart >=
+                           RESYNC_XFER_TIMEOUT_MS + RESYNC_LOAD_TIMEOUT_MS) {
+                    s_resyncState = 0;
+                    coopErr("[resync] aborted (load would not issue)");
+                }
+            }
+        }
         // Coordinated save + session resume (protocol 31): host-arbitrated
         // save edges, folder-quiescence completion, paced in-band folder
         // transfer, staged+verified commit on the join.
@@ -1238,6 +1377,285 @@ void tickCoordinatedSaveLoad(GameWorld* gw) {
         // fingerprint-verified join follow, SaveXfer fallback on divergence.
         if (g_cfg.loadSync)
             driveLoadSync(gw);
+    }
+}
+
+// ---- v48: in-band DLL auto-update + MP log shipping --------------------------
+// Runs from BOTH tick roots (mainLoop_hook in-game, titleUpdate_hook at the
+// menu - a DLL update usually lands while the join sits at the title screen).
+// Drains the file-push queues, dispatches completed payloads (DLL -> rename
+// swap + restart banner; LOG -> KenshiCoopLogs\peer\), drives the paced
+// sender, and runs the join's log-segment shipping queue.
+
+// Cap a received-segment folder to logMaxFiles KenshiCoop_* files (oldest
+// deleted; same policy CoopLog applies to our own segments).
+void prunePeerLogDir(const std::string& dir) {
+    std::string pat = dir + "\\KenshiCoop_*";
+    std::vector<std::pair<unsigned __int64, std::string> > files;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        unsigned __int64 t = ((unsigned __int64)fd.ftLastWriteTime.dwHighDateTime << 32)
+                           | fd.ftLastWriteTime.dwLowDateTime;
+        files.push_back(std::make_pair(t, std::string(fd.cFileName)));
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (files.size() <= g_cfg.logMaxFiles) return;
+    std::sort(files.begin(), files.end());
+    unsigned int drop = (unsigned int)files.size() - g_cfg.logMaxFiles;
+    for (unsigned int i = 0; i < drop; ++i)
+        DeleteFileA((dir + "\\" + files[i].second).c_str());
+}
+
+bool readWholeFile(const std::string& path, std::vector<unsigned char>& out) {
+    out.clear();
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    bool ok = false;
+    if (sz > 0) {
+        out.resize((size_t)sz);
+        ok = (std::fread(&out[0], 1, (size_t)sz, f) == (size_t)sz);
+        if (!ok) out.clear();
+    } else if (sz == 0) {
+        ok = false; // nothing worth shipping
+    }
+    std::fclose(f);
+    return ok;
+}
+
+void tickFilePush() {
+    // Deferred update restart (armed by the DLL apply below; runs even after
+    // the net stops): relaunch with the original command line, then die.
+    if (g_updateRestartDue != 0 && GetTickCount() >= g_updateRestartDue) {
+        g_updateRestartDue = 0;
+        coopLog("[update] relaunching Kenshi now");
+        if (coop::selfupdate::relaunchGame()) {
+            coop::logClose();
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+        coopErr("[update] relaunch FAILED - please restart Kenshi manually");
+        g_updateNotice = "Co-op mod UPDATED - restart Kenshi manually";
+    }
+    if (!g_net.isRunning()) return;
+    coop::u32 localId = g_net.localId();
+
+    // Receiver half: assemble chunks, verify + ACK at DONE.
+    {
+        std::deque<coop::InboundFileBegin> fbs;
+        g_inbound.drainFileBegins(fbs);
+        for (std::deque<coop::InboundFileBegin>::iterator it = fbs.begin();
+             it != fbs.end(); ++it)
+            coop::filepush::feedBegin(*it);
+        std::deque<coop::InboundFileChunk> fcs;
+        g_inbound.drainFileChunks(fcs);
+        for (std::deque<coop::InboundFileChunk>::iterator it = fcs.begin();
+             it != fcs.end(); ++it)
+            coop::filepush::feedChunk(*it);
+        std::deque<coop::InboundFileDone> fds;
+        g_inbound.drainFileDones(fds);
+        for (std::deque<coop::InboundFileDone>::iterator it = fds.begin();
+             it != fds.end(); ++it)
+            coop::filepush::feedDone(*it, g_net, localId);
+    }
+
+    // Dispatch completed payloads.
+    {
+        coop::u8 purpose = 0;
+        std::string name;
+        std::vector<unsigned char> bytes;
+        coop::u32 from = 0;
+        while (coop::filepush::takeCompleted(&purpose, &name, &bytes, &from)) {
+            if (purpose == coop::FILE_PUSH_DLL) {
+                if (coop::selfupdate::applyImage(bytes)) {
+                    // At the MENU there is nothing to lose: restart + reconnect
+                    // automatically (flag file carries transport/peer for the
+                    // next launch). In-game we only banner - the player
+                    // restarts when ready. The short delay lets the ACK (and
+                    // this log line) flush to the host first.
+                    if (!g_gameStarted && !g_cfg.isHost) {
+                        std::string flag = updateReconnectFlagPath();
+                        if (!flag.empty()) {
+                            FILE* f = std::fopen(flag.c_str(), "w");
+                            if (f) {
+                                std::fprintf(f, "steam=%d\npeer=%llu\n",
+                                             (g_cfg.transport == "steam") ? 1 : 0,
+                                             (unsigned long long)g_cfg.steamPeer);
+                                std::fclose(f);
+                            }
+                        }
+                        g_updateRestartDue = GetTickCount() + 1500;
+                        g_updateNotice = "Co-op mod UPDATED - restarting...";
+                        coopLog("[update] new KenshiCoop.dll installed; auto-restarting to load it (reconnect armed)");
+                    } else {
+                        g_updateNotice = "Co-op mod UPDATED - restart Kenshi to finish";
+                        coopLog("[update] new KenshiCoop.dll installed (rename swap done); RESTART Kenshi to load it");
+                    }
+                } else {
+                    coopErr("[update] received DLL could NOT be installed (see [update] lines above)");
+                }
+            } else if (purpose == coop::FILE_PUSH_LOG) {
+                // Basename only - a pushed name never carries a path, but be sure.
+                size_t cut = name.find_last_of("\\/");
+                if (cut != std::string::npos) name = name.substr(cut + 1);
+                std::string base = logSegmentsDir();
+                std::string dir  = base + "\\peer";
+                CreateDirectoryA(base.c_str(), 0);
+                CreateDirectoryA(dir.c_str(), 0);
+                std::string path = dir + "\\" + name;
+                FILE* f = std::fopen(path.c_str(), "wb");
+                bool ok = false;
+                if (f) {
+                    ok = std::fwrite(&bytes[0], 1, bytes.size(), f) == bytes.size();
+                    std::fclose(f);
+                }
+                char b[640];
+                _snprintf(b, sizeof(b) - 1, "[logship] peer segment %s: %s (%u bytes)",
+                          ok ? "stored" : "WRITE FAILED", path.c_str(),
+                          (unsigned)bytes.size());
+                b[sizeof(b) - 1] = '\0';
+                coopLog(b);
+                prunePeerLogDir(dir);
+            }
+        }
+    }
+
+    // Host: start a DLL push on either trigger (held version-mismatch, or a
+    // same-protocol fingerprint mismatch from the join's BUILD_INFO).
+    {
+        bool        wantPush = false;
+        const char* why      = 0;
+        std::deque<coop::InboundVerMismatch> vms;
+        g_inbound.drainVerMismatches(vms);
+        std::deque<coop::InboundBuildInfo> bis;
+        g_inbound.drainBuildInfos(bis);
+        if (g_cfg.isHost && g_cfg.dllPush) {
+            if (!vms.empty()) {
+                wantPush = true;
+                why = "protocol mismatch (held handshake)";
+            }
+            for (std::deque<coop::InboundBuildInfo>::iterator it = bis.begin();
+                 it != bis.end(); ++it) {
+                coop::u32 crc = 0, size = 0;
+                if (coop::selfupdate::selfInfo(&crc, &size)) {
+                    if (it->pkt.dllCrc != crc) {
+                        wantPush = true;
+                        why = "build fingerprint differs";
+                    } else {
+                        coopLog("[update] join build matches ours (fingerprint ok)");
+                    }
+                }
+            }
+            if (wantPush && !coop::filepush::sending()) {
+                std::vector<unsigned char> dll;
+                if (coop::selfupdate::readSelfBytes(dll) &&
+                    coop::filepush::beginSend(g_net, localId, coop::FILE_PUSH_DLL,
+                                              "KenshiCoop.dll", dll)) {
+                    char b[160];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[update] pushing our KenshiCoop.dll to the join (%s)", why);
+                    b[sizeof(b) - 1] = '\0';
+                    coopLog(b);
+                } else {
+                    coopErr("[update] could not read/queue our own DLL for the push");
+                }
+            }
+        }
+        // Non-host / push off: the drains above still ran, so queues stay empty.
+    }
+
+    // Sender half: ACK observation (also completes a log shipment), then pacing.
+    {
+        std::deque<coop::InboundFileAck> fas;
+        g_inbound.drainFileAcks(fas);
+        for (std::deque<coop::InboundFileAck>::iterator it = fas.begin();
+             it != fas.end(); ++it) {
+            coop::filepush::noteAck(it->pkt);
+            // One transfer in flight at a time, and each side pushes only one
+            // purpose (host: DLL, join: LOG) - so an ACK while a log shipment
+            // is outstanding answers exactly that shipment.
+            if (!g_logShipInFlight.empty() && !coop::filepush::sending()) {
+                if (it->pkt.ok) {
+                    std::string sent = g_logShipInFlight + ".sent";
+                    MoveFileA(g_logShipInFlight.c_str(), sent.c_str());
+                    coopLog("[logship] segment delivered (renamed .sent)");
+                } else {
+                    g_logShipQueue.push_back(g_logShipInFlight); // retry later
+                    coopLog("[logship] segment delivery FAILED (requeued)");
+                }
+                g_logShipInFlight.clear();
+            }
+        }
+        coop::filepush::tickSend(g_net, localId);
+    }
+
+    // Log shipping (join): queue finished segments, rescan for unshipped
+    // leftovers on connect (crash survivors included), start the next push.
+    {
+        // Drain the rotation ring ALWAYS so it never fills; only a shipping
+        // join queues the paths (files stay on disk for a later scan otherwise).
+        char segs[8][512];
+        unsigned int n = coop::logTakeFinishedSegments(segs, 8);
+        for (unsigned int i = 0; i < n; ++i)
+            if (!g_cfg.isHost && g_cfg.logShip)
+                g_logShipQueue.push_back(std::string(segs[i]));
+
+        if (!g_cfg.isHost && g_cfg.logShip && g_peerPresent) {
+            if (g_logShipRescan) {
+                g_logShipRescan = false;
+                char cur[512];
+                coop::logCurrentSegment(cur, sizeof(cur));
+                std::string dir = logSegmentsDir();
+                std::string pat = dir + "\\KenshiCoop_*";
+                WIN32_FIND_DATAA fd;
+                HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+                unsigned int queued = 0;
+                if (h != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                        std::string nm(fd.cFileName);
+                        if (nm.size() < 4 || nm.substr(nm.size() - 4) != ".log")
+                            continue; // shipped copies are *.log.sent
+                        std::string full = dir + "\\" + nm;
+                        if (full == cur) continue; // still being written
+                        bool known = (full == g_logShipInFlight);
+                        for (std::deque<std::string>::iterator q = g_logShipQueue.begin();
+                             !known && q != g_logShipQueue.end(); ++q)
+                            known = (*q == full);
+                        if (!known) {
+                            g_logShipQueue.push_back(full);
+                            ++queued;
+                        }
+                    } while (FindNextFileA(h, &fd));
+                    FindClose(h);
+                }
+                if (queued > 0) {
+                    char b[96];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[logship] %u unshipped segment(s) queued (prior runs)",
+                              queued);
+                    b[sizeof(b) - 1] = '\0';
+                    coopLog(b);
+                }
+            }
+            if (g_logShipInFlight.empty() && !g_logShipQueue.empty() &&
+                !coop::filepush::sending()) {
+                std::string path = g_logShipQueue.front();
+                g_logShipQueue.pop_front();
+                std::vector<unsigned char> bytes;
+                size_t cut = path.find_last_of("\\/");
+                std::string base = (cut == std::string::npos) ? path : path.substr(cut + 1);
+                if (readWholeFile(path, bytes) &&
+                    coop::filepush::beginSend(g_net, localId, coop::FILE_PUSH_LOG,
+                                              base.c_str(), bytes)) {
+                    g_logShipInFlight = path;
+                } // unreadable/empty: dropped (stays on disk for manual pickup)
+            }
+        }
     }
 }
 
@@ -1299,7 +1717,41 @@ void tickScenarioStart(GameWorld* gw) {
 // which case the caches are now stale - skip apply this tick too (the reset runs
 // next tick's top on the reload edge).
 void tickReplicateApply(GameWorld* gw, bool worldLive) {
-    if (worldLive && coop::engine::gameplayLive(gw)) {
+    bool live = worldLive && coop::engine::gameplayLive(gw);
+    // Join world-spawn veto arm/disarm (edge-logged): live JOIN session only.
+    // The host owns NPC existence, so the join's ambient-spawn ticker can only
+    // mint census-absent ghosts - skip it at the detour while the session
+    // lasts. Peer loss or a world swap disarms the same tick (solo spawning
+    // resumes); the host/solo never arm.
+    {
+        bool joinLive = !g_cfg.isHost && g_peerPresent && live;
+        static bool s_spawnVetoOn = false;
+        bool want = g_cfg.spawnVeto && joinLive;
+        if (want != s_spawnVetoOn) {
+            s_spawnVetoOn = want;
+            coop::engine::setSpawnVeto(want);
+            char b[112];
+            _snprintf(b, sizeof(b) - 1,
+                      "[spawn] join world-spawn veto %s (vetoedTicks=%lu)",
+                      want ? "ARMED" : "off", coop::engine::spawnVetoTicks());
+            b[sizeof(b) - 1] = '\0';
+            coopLog(b);
+        }
+        // Town-flavor veto rides the same gate under its own knob/counter.
+        static bool s_townVetoOn = false;
+        bool wantTown = g_cfg.townVeto && joinLive;
+        if (wantTown != s_townVetoOn) {
+            s_townVetoOn = wantTown;
+            coop::engine::setTownVeto(wantTown);
+            char b[112];
+            _snprintf(b, sizeof(b) - 1,
+                      "[spawn] join town-flavor veto %s (vetoedBarflyRolls=%lu)",
+                      wantTown ? "ARMED" : "off", coop::engine::townVetoCalls());
+            b[sizeof(b) - 1] = '\0';
+            coopLog(b);
+        }
+    }
+    if (live) {
         g_repl.applyTargets(gw);
         // Phase W2: relocate our own copy of any DROPPED weapon to the ground BEFORE the
         // inventory reconcile runs, so the conservation move beats the (debounced) removal
@@ -1561,6 +2013,10 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // packets, file IO and the load/save ENTRY points, never a cached world ptr.
     tickCoordinatedSaveLoad(gw);
 
+    // v48 file push (DLL auto-update + log shipping): also g_gameStarted-free -
+    // it touches only net queues and file IO.
+    tickFilePush();
+
     // Scenario onStart (harness): pre-arm hold + peer-ready/timeout arm, fired
     // once BEFORE the engine tick so a host-issued order takes effect this frame.
     tickScenarioStart(gw);
@@ -1617,6 +2073,43 @@ void titleUpdate_hook(TitleScreen* self) {
         }
     }
 
+    // v48 auto-reconnect after a DLL-update restart: the updater wrote a flag
+    // file (transport + peer) before relaunching. Consume it once, wait a
+    // short settle for Steam/GUI to come up, then connect as JOIN exactly as
+    // the F2 panel would - Drew is back in the session with zero input.
+    {
+        static int                s_state = 0; // 0 unchecked, 1 armed, 2 done
+        static bool               s_useSteam = true;
+        static unsigned long long s_peer = 0;
+        static DWORD              s_since = 0;
+        if (s_state == 0) {
+            s_state = 2;
+            std::string flag = updateReconnectFlagPath();
+            if (!flag.empty()) {
+                FILE* f = std::fopen(flag.c_str(), "r");
+                if (f) {
+                    int steam = 1;
+                    unsigned long long peer = 0;
+                    if (std::fscanf(f, "steam=%d\npeer=%llu", &steam, &peer) >= 1) {
+                        s_useSteam = (steam != 0);
+                        s_peer     = peer;
+                        s_state    = 1;
+                        s_since    = GetTickCount();
+                        coopLog("[update] reconnect flag found; auto-connect as JOIN armed");
+                    }
+                    std::fclose(f);
+                    DeleteFileA(flag.c_str());
+                }
+            }
+        }
+        if (s_state == 1 && !g_net.isRunning() &&
+            (GetTickCount() - s_since) >= 3000) {
+            s_state = 2;
+            coopLog("[update] auto-reconnecting after update restart");
+            coopUiConnect(false /*join*/, s_useSteam, s_peer);
+        }
+    }
+
     // Push-save-on-connect (join, main menu). A join that has gone ONLINE must
     // drain the connect edge, receive the host's pushed save, and load it while
     // still at the title screen - work that normally only runs in-game from
@@ -1630,11 +2123,18 @@ void titleUpdate_hook(TitleScreen* self) {
         processNetEvents(0);
         if (g_cfg.saveSync) driveSaveSync();
         if (g_cfg.loadSync && coop::engine::savesReady()) driveLoadSync(0);
+        // v48: receive a DLL update / ship logs while waiting at the menu.
+        tickFilePush();
         // F2 panel while the join waits at the menu (guarded; the host's world is
         // the destination, so we skip the config auto-load for a join session).
         coopPanelDriveSeh(0);
         return;
     }
+
+    // v48 (host at the menu): a version-mismatched join is HELD by the net
+    // thread for a DLL push - drive it here, since the host's in-game pump
+    // isn't running yet.
+    if (g_net.isRunning()) tickFilePush();
 
     // Co-op panel (F2) at the main menu for the HOST / offline case: lets a user
     // toggle ONLINE and paste a Steam ID before any save is loaded. Guarded
@@ -1660,6 +2160,11 @@ void titleUpdate_hook(TitleScreen* self) {
 }
 
 void startNetworking() {
+    // v48 DLL push: the HOST holds a version-mismatched HELLO open for an
+    // in-band DLL update instead of rejecting it. Re-armed here because the
+    // host/join role can be chosen at the F2 panel right before this call.
+    g_net.setDllPushHold(g_cfg.isHost && g_cfg.dllPush);
+
     // Debug WAN simulation: when configured, hold/drop inbound entity batches so the
     // loopback harness exercises the real-latency path (interp + local enforcement)
     // instead of the ~0 ms same-frame delivery we'd otherwise validate against.
@@ -1736,6 +2241,17 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // squad, so that unit never moves on the client (unowned NPCs still sync).
     coop::resolveOwnRanks(g_cfg.ownRanks, isHost, g_cfg.ownRanksFromEnv);
     g_repl.setOwnRanks(g_cfg.ownRanks);
+    // Role-derived channel wiring latched by configureReplicator() at startup
+    // must follow the PANEL role too (2026-08-01 session: a default-HOST
+    // config that picked JOIN here kept census-authoring world chests -
+    // dual-writer containers, deposits invisible to the host - and never
+    // armed the join-dealt combat report).
+    g_repl.setStoreSync(g_cfg.storeSync && g_cfg.isHost);
+    g_repl.setReportCombat(g_cfg.damageGuard && !g_cfg.isHost);
+    g_repl.setGateAuthority(g_cfg.gateAuthority && !g_cfg.isHost);
+    // Log tag follows the panel role too, so shipped segments stop arriving
+    // named HOST from a panel-JOIN client.
+    coop::logSetTag(g_cfg.isHost ? "HOST" : "JOIN");
 
     std::string ranks;
     for (std::set<unsigned int>::const_iterator it = g_cfg.ownRanks.begin();
@@ -1763,6 +2279,13 @@ void coopUiDisconnect() {
     // World stays live on a manual disconnect: despawn minted proxies before
     // clearing maps so nothing lingers as a duplicate or gets baked into a save.
     sessionResetForUi();
+}
+
+// Resync (F2 button, host with live peer - the panel pre-validates): latch the
+// request; the driver in tickCoordinatedSaveLoad owns the gates + state machine.
+void coopUiResync() {
+    g_resyncRequested = true;
+    coopLog("[resync] requested from F2 panel");
 }
 
 } // namespace
@@ -2122,6 +2645,29 @@ void installEngineDetours() {
             coopLog("[fac] FAILED to install affectRelations detours; relation logging degraded");
     }
 
+    // Join world-spawn veto: detour ZoneManager::spawnChecksUpdateThreaded
+    // (pass-through until armed). Armed per tick only on a live JOIN session -
+    // solo play and the host run the original ticker untouched. Installed
+    // whenever the knob is on (not just for a configured join) because the
+    // host/join role can still be chosen at the title screen after this
+    // install point.
+    if (g_cfg.spawnVeto) {
+        if (coop::engine::installSpawnVetoHook())
+            coopLog("[spawn] spawn-checks detour installed; join world-spawn veto ready");
+        else
+            coopLog("[spawn] FAILED to install spawn-checks detour; join world-spawn veto off (census cull only)");
+    }
+
+    // Town-flavor veto (same regime, separate knob): skip the join's per-visit
+    // bar-patron rolls (Town::spawnTheBarFlies); the host's rolls cover its
+    // bars via census/spawn-info proxies.
+    if (g_cfg.townVeto) {
+        if (coop::engine::installTownVetoHook())
+            coopLog("[spawn] barflies detour installed; join town-flavor veto ready");
+        else
+            coopLog("[spawn] FAILED to install barflies detour; join town-flavor veto off (census cull only)");
+    }
+
     // Coordinated save (protocol 31): detour SaveManager::save so every local
     // save (menu, quicksave, autosave timer, programmatic bake) logs its
     // "[save] LOCAL-SAVE" edge and queues a SaveEdge - the trigger for the
@@ -2185,6 +2731,12 @@ __declspec(dllexport) void startPlugin() {
     // timestamp in this run (and every time-sync packet) shares the skewed clock.
     coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
     coop::logInit(g_cfg.logPath.c_str(), g_cfg.isHost ? "HOST" : "JOIN");
+
+    // v48: finish a prior in-band DLL update (delete the .old the rename swap
+    // left) and arm the MP log segment mirror (15-min rotating files under
+    // KenshiCoopLogs\, capped; the join ships finished segments to the host).
+    coop::selfupdate::cleanupOld();
+    coop::logSegmentsInit(logSegmentsDir().c_str(), g_cfg.logSegMin, g_cfg.logMaxFiles);
 
     // Last-chance crash recorder: report + minidump for ANY unhandled fault on
     // ANY thread (engine included), and a "[crash] PREVIOUS session ended in a
